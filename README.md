@@ -13,6 +13,11 @@ logs experiments with MLflow, and generates the Kaggle submission file:
 submission.csv
 ```
 
+Both submitted code files are complete:
+
+- `classification_pipeline.ipynb` is self-contained and includes the full workflow split into readable notebook cells.
+- `classification_pipeline.py` is a standalone Python version of the same pipeline for direct execution.
+
 The notebook also includes two validation-audit sections:
 
 - `course_baseline_results.csv`: simpler models inspired by the lectures, such as KNN, Logistic Regression, Decision Tree, Bagging, and AdaBoost.
