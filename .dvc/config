@@ -1,0 +1,4 @@
+[core]
+    remote = storage
+['remote "storage"']
+    url = G:\My Drive\FITE_Classification_Challenge_DVC

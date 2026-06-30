@@ -1,0 +1,17 @@
+/train_data.csv
+/test_data.csv
+/sample_submission.csv
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Local/generated experiment outputs. The notebook can regenerate them.
+classification_artifacts/final_ensemble.joblib
+mlruns/
+
+# Keep this local unless the instructor explicitly asks for the DB file.
+# The final notebook can regenerate MLflow runs.
+# mlflow.db
+
+# Old competition folder is kept locally for reference, not for this repo.
+car_price_pipeline/
