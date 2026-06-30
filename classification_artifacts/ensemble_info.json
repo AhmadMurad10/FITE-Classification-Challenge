@@ -64,7 +64,7 @@
       "f1_macro": 0.9872198430381989
     },
     {
-      "label": "team_lesson06_weights",
+      "label": "reference_soft_voting_weights",
       "accuracy": 0.9975,
       "f1_macro": 0.9907880061770763
     }

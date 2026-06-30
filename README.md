@@ -20,7 +20,7 @@ Both submitted code files are complete:
 
 The notebook also includes two validation-audit sections:
 
-- `course_baseline_results.csv`: simpler models inspired by the lectures, such as KNN, Logistic Regression, Decision Tree, Bagging, and AdaBoost.
+- `baseline_results.csv`: simpler comparison models such as KNN, Logistic Regression, Decision Tree, Bagging, and AdaBoost.
 - `robust_validation_summary.csv`: repeated cross-validation checks across multiple random seeds to verify that the strongest models are stable and not just lucky on one split.
 
 ## How To Run

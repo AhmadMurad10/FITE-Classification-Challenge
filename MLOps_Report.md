@@ -78,7 +78,7 @@ We ran more than three experiments. The main model families included:
 - Gradient Boosting
 - Logistic Regression
 
-We also added course-inspired baseline experiments:
+We also added baseline comparison experiments:
 
 - KNN
 - Logistic Regression

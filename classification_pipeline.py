@@ -136,7 +136,7 @@ class ClassificationFeatureBuilder(BaseEstimator, TransformerMixin):
 
 
 class SimpleAnonymizedFeatureBuilder(BaseEstimator, TransformerMixin):
-    """Smaller feature set inspired by the course feature engineering workflow.
+    """Smaller generic feature set for the anonymized tabular data.
 
     This transformer is deliberately generic because the features are
     anonymized. It adds row-level summaries and interactions among the strongest
@@ -444,28 +444,28 @@ def make_models() -> dict[str, Pipeline]:
     return models
 
 
-def make_course_baseline_models() -> dict[str, Pipeline | BaseEstimator]:
-    """Small baselines inspired by the course notebooks.
+def make_baseline_models() -> dict[str, Pipeline | BaseEstimator]:
+    """Simple baseline models used to document the model-selection path.
 
     These are not automatically used for the final submission. They document
-    the model-selection path and provide a fair comparison against simpler
-    methods from the lectures.
+        the model-selection path and provide a fair comparison against simpler
+        reference models.
     """
 
     return {
-        "lesson02_knn_scaled": Pipeline(
+        "knn_scaled": Pipeline(
             [
                 ("scaler", StandardScaler()),
                 ("model", KNeighborsClassifier(n_neighbors=5, weights="distance")),
             ]
         ),
-        "lesson03_decision_tree_balanced": DecisionTreeClassifier(
+        "decision_tree_balanced": DecisionTreeClassifier(
             max_depth=8,
             min_samples_leaf=3,
             class_weight="balanced",
             random_state=RANDOM_STATE,
         ),
-        "lesson06_bagging_tree": BaggingClassifier(
+        "bagging_tree": BaggingClassifier(
             estimator=DecisionTreeClassifier(
                 min_samples_leaf=2,
                 class_weight="balanced",
@@ -475,7 +475,7 @@ def make_course_baseline_models() -> dict[str, Pipeline | BaseEstimator]:
             random_state=RANDOM_STATE,
             n_jobs=-1,
         ),
-        "lesson06_adaboost_tree": AdaBoostClassifier(
+        "adaboost_tree": AdaBoostClassifier(
             estimator=DecisionTreeClassifier(
                 max_depth=2,
                 class_weight="balanced",
@@ -485,7 +485,7 @@ def make_course_baseline_models() -> dict[str, Pipeline | BaseEstimator]:
             learning_rate=0.05,
             random_state=RANDOM_STATE,
         ),
-        "lesson02_logreg_balanced_fe_scaled": Pipeline(
+        "logreg_balanced_fe_scaled": Pipeline(
             [
                 ("features", ClassificationFeatureBuilder()),
                 ("scaler", StandardScaler()),
@@ -539,24 +539,24 @@ def evaluate_pipeline_collection(
     return pd.DataFrame(rows).sort_values("f1_macro_mean", ascending=False)
 
 
-def run_course_baseline_audit(
+def run_baseline_audit(
     X: pd.DataFrame,
     y: pd.Series,
     mlflow_module=None,
 ) -> pd.DataFrame:
-    """Evaluate simpler lecture-inspired baselines for documentation."""
+    """Evaluate simpler baseline models for documentation."""
 
     ARTIFACT_DIR.mkdir(exist_ok=True)
-    print("\nCourse baseline audit:")
-    baseline_df = evaluate_pipeline_collection(make_course_baseline_models(), X, y, RANDOM_STATE)
-    baseline_df.to_csv(ARTIFACT_DIR / "course_baseline_results.csv", index=False)
+    print("\nBaseline audit:")
+    baseline_df = evaluate_pipeline_collection(make_baseline_models(), X, y, RANDOM_STATE)
+    baseline_df.to_csv(ARTIFACT_DIR / "baseline_results.csv", index=False)
     print(baseline_df.to_string(index=False))
 
     if mlflow_module is not None:
         for _, row in baseline_df.iterrows():
             with mlflow_module.start_run(run_name=f"baseline_{row['model_name']}"):
                 mlflow_module.log_param("model_name", row["model_name"])
-                mlflow_module.log_param("purpose", "course_baseline_audit")
+                mlflow_module.log_param("purpose", "baseline_audit")
                 mlflow_module.log_param("n_splits", N_SPLITS)
                 mlflow_module.log_param("random_state", int(row["random_state"]))
                 mlflow_module.log_metric("accuracy_mean", float(row["accuracy_mean"]))
@@ -936,7 +936,7 @@ def main() -> None:
     print(y.value_counts(normalize=True).sort_index().round(4).to_string())
 
     models, results, oof_probabilities = evaluate_models(X, y, label_encoder, mlflow_module)
-    run_course_baseline_audit(X, y, mlflow_module)
+    run_baseline_audit(X, y, mlflow_module)
     run_robust_validation_audit(X, y, mlflow_module)
     ensemble_info = optimize_ensemble_weights(y, label_encoder, oof_probabilities)
     test_proba, final_models = fit_final_and_predict(models, X, y, X_test, ensemble_info)

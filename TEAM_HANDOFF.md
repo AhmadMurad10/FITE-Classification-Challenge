@@ -48,7 +48,7 @@ mlflow ui --backend-store-uri sqlite:///mlflow.db
 - حللنا شكل الداتا وتوزيع الكلاسات.
 - استخدمنا `Macro F1` لأن الداتا غير متوازنة.
 - استخدمنا `StratifiedKFold` للتقييم.
-- جربنا Baselines من المحاضرات مثل KNN و Logistic Regression و Decision Tree و Bagging و AdaBoost.
+- جربنا نماذج مقارنة بسيطة مثل KNN و Logistic Regression و Decision Tree و Bagging و AdaBoost.
 - جربنا موديلات أقوى مثل LightGBM و RandomForest و HistGradientBoosting و XGBoost.
 - أضفنا Robust Validation على أكثر من `random_state`.
 - استخدمنا Ensemble لأنه أعطى أفضل OOF Macro F1.

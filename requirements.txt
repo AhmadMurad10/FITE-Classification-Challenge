@@ -7,3 +7,5 @@ mlflow
 lightgbm
 xgboost
 dvc
+ipykernel
+nbconvert
