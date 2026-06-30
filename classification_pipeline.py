@@ -37,8 +37,8 @@ from sklearn.ensemble import (
     RandomForestClassifier,
 )
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, classification_report, confusion_matrix, f1_score, roc_auc_score
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.tree import DecisionTreeClassifier, export_text
 from sklearn.pipeline import Pipeline
@@ -58,6 +58,8 @@ OUTPUT_FILE = "submission.csv"
 EXPERIMENT_LOG_FILE = "classification_experiment_log.csv"
 ARTIFACT_DIR = Path("classification_artifacts")
 ROBUST_VALIDATION_SEEDS = [7, 42, 123]
+BLENDING_HOLDOUT_SEEDS = [7, 42, 123, 2026, 2027]
+STABLE_ENSEMBLE_F1_TOLERANCE = 0.0020
 
 
 def set_all_seeds(seed: int = RANDOM_STATE) -> None:
@@ -204,6 +206,117 @@ class SimpleAnonymizedFeatureBuilder(BaseEstimator, TransformerMixin):
         return out.astype(float)
 
 
+class EDAFeatureBuilder(BaseEstimator, TransformerMixin):
+    """Fold-safe EDA-driven features for the anonymized tabular data.
+
+    The features are still generic, but they focus on patterns that repeatedly
+    appeared useful during train-only analysis: f10/f14/f9/f2 interactions,
+    f12 interactions, default-like binary rows, repeated tuples, and continuous
+    tail indicators.
+    """
+
+    def fit(self, X: pd.DataFrame, y=None):
+        X = pd.DataFrame(X).copy()
+        self.feature_names_in_ = list(X.columns)
+        self.binary_cols_ = []
+        self.cont_cols_ = []
+        for col in self.feature_names_in_:
+            vals = set(pd.Series(X[col]).dropna().unique())
+            if vals.issubset({0, 1, 0.0, 1.0}):
+                self.binary_cols_.append(col)
+            else:
+                self.cont_cols_.append(col)
+
+        quantiles = [0.01, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99]
+        self.cont_quantiles_ = {
+            col: X[col].quantile(quantiles).to_dict()
+            for col in self.cont_cols_
+        }
+        if self.binary_cols_:
+            self.default_binary_pattern_ = X[self.binary_cols_].mode().iloc[0].astype(int)
+        else:
+            self.default_binary_pattern_ = pd.Series(dtype=int)
+
+        tuple_counts = X[self.feature_names_in_].apply(lambda row: tuple(row.values.tolist()), axis=1).value_counts()
+        self.tuple_count_map_ = tuple_counts.to_dict()
+        return self
+
+    def transform(self, X: pd.DataFrame):
+        X = pd.DataFrame(X).copy()
+        X = X[self.feature_names_in_]
+        out = X.copy()
+        eps = 1e-9
+
+        if self.binary_cols_:
+            binary_values = X[self.binary_cols_].astype(int)
+            out["binary_sum"] = binary_values.sum(axis=1)
+            out["binary_mean"] = binary_values.mean(axis=1)
+            out["default_binary_distance"] = binary_values.ne(self.default_binary_pattern_, axis=1).sum(axis=1)
+            out["is_default_binary_pattern"] = (out["default_binary_distance"] == 0).astype(int)
+            out["binary_distance_ge_3"] = (out["default_binary_distance"] >= 3).astype(int)
+        else:
+            out["binary_sum"] = 0
+            out["binary_mean"] = 0
+            out["default_binary_distance"] = 0
+            out["is_default_binary_pattern"] = 0
+            out["binary_distance_ge_3"] = 0
+
+        if self.cont_cols_:
+            out["cont_mean"] = X[self.cont_cols_].mean(axis=1)
+            out["cont_std"] = X[self.cont_cols_].std(axis=1).fillna(0)
+            out["cont_range"] = X[self.cont_cols_].max(axis=1) - X[self.cont_cols_].min(axis=1)
+            out["continuous_outlier_count"] = 0
+            for col in self.cont_cols_:
+                q = self.cont_quantiles_[col]
+                out[f"{col}_ge_q75"] = (X[col] >= q[0.75]).astype(int)
+                out[f"{col}_ge_q90"] = (X[col] >= q[0.90]).astype(int)
+                out[f"{col}_le_q10"] = (X[col] <= q[0.10]).astype(int)
+                out[f"{col}_tail"] = ((X[col] <= q[0.01]) | (X[col] >= q[0.99])).astype(int)
+                out["continuous_outlier_count"] += out[f"{col}_tail"]
+        else:
+            out["cont_mean"] = 0
+            out["cont_std"] = 0
+            out["cont_range"] = 0
+            out["continuous_outlier_count"] = 0
+
+        def has(*cols: str) -> bool:
+            return all(col in X.columns for col in cols)
+
+        if has("f10", "f12"):
+            f12_zero = (X["f12"] == 0).astype(int)
+            f12_one = (X["f12"] == 1).astype(int)
+            out["f10_when_f12_0"] = X["f10"] * f12_zero
+            out["f10_when_f12_1"] = X["f10"] * f12_one
+            if "f10" in self.cont_quantiles_:
+                out["f10_ge_q75_and_f12_0"] = ((X["f10"] >= self.cont_quantiles_["f10"][0.75]) & (X["f12"] == 0)).astype(int)
+                out["f10_ge_q90_and_f12_0"] = ((X["f10"] >= self.cont_quantiles_["f10"][0.90]) & (X["f12"] == 0)).astype(int)
+        if has("f10", "f14"):
+            out["f10_div_f14"] = X["f10"] / (X["f14"] + eps)
+            out["f10_minus_f14"] = X["f10"] - X["f14"]
+            out["f10_mul_f14"] = X["f10"] * X["f14"]
+            if "f10" in self.cont_quantiles_ and "f14" in self.cont_quantiles_:
+                out["f10_f14_both_high"] = (
+                    (X["f10"] >= self.cont_quantiles_["f10"][0.75])
+                    & (X["f14"] >= self.cont_quantiles_["f14"][0.75])
+                ).astype(int)
+        if has("f10", "f9"):
+            out["f10_div_f9"] = X["f10"] / (X["f9"] + eps)
+            out["f10_minus_f9"] = X["f10"] - X["f9"]
+            out["f10_mul_f9"] = X["f10"] * X["f9"]
+        if has("f2", "f10"):
+            out["f2_mul_f10"] = X["f2"] * X["f10"]
+            out["f2_div_f10"] = X["f2"] / (X["f10"] + eps)
+
+        tuple_keys = X[self.feature_names_in_].apply(lambda row: tuple(row.values.tolist()), axis=1)
+        tuple_count = tuple_keys.map(self.tuple_count_map_).fillna(0).astype(float)
+        out["repeated_tuple_count"] = tuple_count
+        out["repeated_tuple_log1p"] = np.log1p(tuple_count)
+        out["is_repeated_tuple"] = (tuple_count > 1).astype(int)
+
+        out = out.replace([np.inf, -np.inf], np.nan).fillna(0)
+        return out.astype(float)
+
+
 class LabelEncodedClassifier(BaseEstimator, ClassifierMixin):
     """Wrapper for classifiers that require numeric class labels."""
 
@@ -234,6 +347,13 @@ def try_import_mlflow():
         return mlflow
     except Exception:
         return None
+
+
+def end_active_mlflow_run(mlflow_module) -> None:
+    """Close any active MLflow run before starting a new top-level run."""
+
+    if mlflow_module is not None and mlflow_module.active_run() is not None:
+        mlflow_module.end_run()
 
 
 @dataclass
@@ -320,6 +440,35 @@ def make_models() -> dict[str, Pipeline]:
                 ),
             ]
         ),
+        "decision_tree_raw_depth5": Pipeline(
+            [
+                (
+                    "model",
+                    DecisionTreeClassifier(
+                        max_depth=5,
+                        class_weight="balanced",
+                        random_state=RANDOM_STATE + 14,
+                    ),
+                ),
+            ]
+        ),
+        "bagging_tree_original": Pipeline(
+            [
+                (
+                    "model",
+                    BaggingClassifier(
+                        estimator=DecisionTreeClassifier(
+                            min_samples_leaf=2,
+                            class_weight="balanced",
+                            random_state=RANDOM_STATE + 15,
+                        ),
+                        n_estimators=120,
+                        random_state=RANDOM_STATE + 16,
+                        n_jobs=-1,
+                    ),
+                ),
+            ]
+        ),
         "random_forest_balanced_fe": Pipeline(
             [
                 ("features", ClassificationFeatureBuilder()),
@@ -332,6 +481,21 @@ def make_models() -> dict[str, Pipeline]:
                         class_weight="balanced_subsample",
                         random_state=RANDOM_STATE + 2,
                         n_jobs=-1,
+                    ),
+                ),
+            ]
+        ),
+        "hgb_eda_fe": Pipeline(
+            [
+                ("features", EDAFeatureBuilder()),
+                (
+                    "model",
+                    HistGradientBoostingClassifier(
+                        max_iter=320,
+                        learning_rate=0.04,
+                        max_leaf_nodes=31,
+                        l2_regularization=0.02,
+                        random_state=RANDOM_STATE + 17,
                     ),
                 ),
             ]
@@ -404,6 +568,9 @@ def make_models() -> dict[str, Pipeline]:
         models["lightgbm_simple_fe"] = Pipeline(
             [("features", SimpleAnonymizedFeatureBuilder()), ("model", LGBMClassifier(**lgbm_params))]
         )
+        models["lightgbm_eda_fe"] = Pipeline(
+            [("features", EDAFeatureBuilder()), ("model", LGBMClassifier(**lgbm_params))]
+        )
     except Exception as exc:
         print(f"LightGBM unavailable, skipped: {exc}")
 
@@ -434,7 +601,11 @@ def make_models() -> dict[str, Pipeline]:
         "lightgbm_simple_fe",
         "lightgbm_original",
         "random_forest_original",
+        "decision_tree_raw_depth5",
+        "bagging_tree_original",
         "extra_trees_original",
+        "lightgbm_eda_fe",
+        "hgb_eda_fe",
         "hgb_original",
         "hgb_simple_fe",
         "xgboost_simple_fe",
@@ -570,6 +741,7 @@ def run_baseline_audit(
 
     if mlflow_module is not None:
         for _, row in baseline_df.iterrows():
+            end_active_mlflow_run(mlflow_module)
             with mlflow_module.start_run(run_name=f"baseline_{row['model_name']}"):
                 mlflow_module.log_param("model_name", row["model_name"])
                 mlflow_module.log_param("purpose", "baseline_audit")
@@ -580,8 +752,11 @@ def run_baseline_audit(
                 mlflow_module.log_metric("balanced_accuracy_mean", float(row["balanced_accuracy_mean"]))
                 mlflow_module.log_metric("f1_macro_mean", float(row["f1_macro_mean"]))
                 mlflow_module.log_metric("f1_macro_std", float(row["f1_macro_std"]))
-        mlflow_module.log_artifact(str(ARTIFACT_DIR / "raw_decision_tree_feature_importance.csv"), artifact_path="classification_artifacts")
-        mlflow_module.log_artifact(str(ARTIFACT_DIR / "raw_decision_tree_rules.txt"), artifact_path="classification_artifacts")
+        end_active_mlflow_run(mlflow_module)
+        with mlflow_module.start_run(run_name="raw_decision_tree_diagnostics"):
+            mlflow_module.log_param("purpose", "raw_tree_interpretability")
+            mlflow_module.log_artifact(str(ARTIFACT_DIR / "raw_decision_tree_feature_importance.csv"), artifact_path="classification_artifacts")
+            mlflow_module.log_artifact(str(ARTIFACT_DIR / "raw_decision_tree_rules.txt"), artifact_path="classification_artifacts")
 
     return baseline_df
 
@@ -598,8 +773,13 @@ def run_robust_validation_audit(
     selected_names = [
         "lightgbm_simple_fe",
         "lightgbm_original",
+        "lightgbm_eda_fe",
         "gradient_boosting_fe",
         "hgb_simple_fe",
+        "hgb_eda_fe",
+        "random_forest_original",
+        "decision_tree_raw_depth5",
+        "bagging_tree_original",
     ]
     selected_models = {name: all_models[name] for name in selected_names if name in all_models}
 
@@ -628,6 +808,7 @@ def run_robust_validation_audit(
 
     if mlflow_module is not None:
         for _, row in summary_df.iterrows():
+            end_active_mlflow_run(mlflow_module)
             with mlflow_module.start_run(run_name=f"robust_{row['model_name']}"):
                 mlflow_module.log_param("model_name", row["model_name"])
                 mlflow_module.log_param("purpose", "robust_validation_multi_seed")
@@ -643,6 +824,55 @@ def run_robust_validation_audit(
                 )
 
     return summary_df
+
+
+def run_adversarial_validation(
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    mlflow_module=None,
+) -> pd.DataFrame:
+    """Check whether train and test feature distributions are easy to separate."""
+
+    X_adv = pd.concat([X_train, X_test], axis=0, ignore_index=True)
+    y_adv = pd.Series([0] * len(X_train) + [1] * len(X_test))
+    cv = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+    oof = np.zeros(len(X_adv), dtype=float)
+    for train_idx, valid_idx in cv.split(X_adv, y_adv):
+        model = RandomForestClassifier(
+            n_estimators=250,
+            max_features="sqrt",
+            min_samples_leaf=3,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+        )
+        model.fit(X_adv.iloc[train_idx], y_adv.iloc[train_idx])
+        oof[valid_idx] = model.predict_proba(X_adv.iloc[valid_idx])[:, 1]
+
+    auc = roc_auc_score(y_adv, oof)
+    rows = []
+    for feature in X_train.columns:
+        rows.append(
+            {
+                "feature": feature,
+                "train_mean": float(X_train[feature].mean()),
+                "test_mean": float(X_test[feature].mean()),
+                "abs_mean_diff": float(abs(X_train[feature].mean() - X_test[feature].mean())),
+            }
+        )
+    drift_df = pd.DataFrame(rows).sort_values("abs_mean_diff", ascending=False)
+    drift_df["adversarial_auc"] = float(auc)
+    drift_df.to_csv(ARTIFACT_DIR / "adversarial_validation.csv", index=False)
+
+    if mlflow_module is not None:
+        end_active_mlflow_run(mlflow_module)
+        with mlflow_module.start_run(run_name="adversarial_validation"):
+            mlflow_module.log_param("purpose", "train_test_distribution_check")
+            mlflow_module.log_metric("adversarial_auc", float(auc))
+            mlflow_module.log_artifact(str(ARTIFACT_DIR / "adversarial_validation.csv"), artifact_path="classification_artifacts")
+
+    print("\nAdversarial validation AUC:", round(float(auc), 6))
+    print(drift_df.head(12).to_string(index=False))
+    return drift_df
 
 
 def evaluate_models(X: pd.DataFrame, y: pd.Series, label_encoder: LabelEncoder, mlflow_module=None):
@@ -702,6 +932,7 @@ def evaluate_models(X: pd.DataFrame, y: pd.Series, label_encoder: LabelEncoder, 
         oof_probabilities[model_name] = oof_proba
 
         if mlflow_module is not None:
+            end_active_mlflow_run(mlflow_module)
             with mlflow_module.start_run(run_name=model_name):
                 mlflow_module.log_param("model_name", model_name)
                 mlflow_module.log_param("n_splits", N_SPLITS)
@@ -813,6 +1044,173 @@ def optimize_ensemble_weights(
     }
 
 
+def make_weight_candidates(model_names: list[str], random_state: int, n_random: int = 2000):
+    """Generate single-model, reference, and random convex ensemble weights."""
+
+    rng = np.random.default_rng(random_state)
+    candidates = []
+    labels = []
+    for i in range(len(model_names)):
+        w = np.zeros(len(model_names))
+        w[i] = 1.0
+        candidates.append(w)
+        labels.append(f"single_{model_names[i]}")
+
+    reference_names = [
+        "lightgbm_simple_fe",
+        "lightgbm_original",
+        "random_forest_original",
+        "extra_trees_original",
+        "hgb_simple_fe",
+        "xgboost_simple_fe",
+    ]
+    reference_weights = np.array([0.169278, 0.103133, 0.273020, 0.156727, 0.038941, 0.258902], dtype=float)
+    if all(name in model_names for name in reference_names):
+        w = np.zeros(len(model_names), dtype=float)
+        for name, weight in zip(reference_names, reference_weights):
+            w[model_names.index(name)] = weight
+        candidates.append(w / w.sum())
+        labels.append("reference_soft_voting_weights")
+
+    for _ in range(n_random):
+        candidates.append(rng.dirichlet(np.ones(len(model_names))))
+        labels.append("random_dirichlet")
+    return candidates, labels
+
+
+def score_weight_vector(weights: np.ndarray, stack: np.ndarray, y_enc: np.ndarray, row_idx: np.ndarray) -> dict[str, float]:
+    """Score one weight vector on a selected row subset."""
+
+    proba = np.tensordot(weights, stack[:, row_idx, :], axes=(0, 0))
+    pred_enc = np.argmax(proba, axis=1)
+    return {
+        "accuracy": float(accuracy_score(y_enc[row_idx], pred_enc)),
+        "f1_macro": float(f1_score(y_enc[row_idx], pred_enc, average="macro")),
+        "balanced_accuracy": float(balanced_accuracy_score(y_enc[row_idx], pred_enc)),
+    }
+
+
+def run_holdout_blending_audit(
+    y: pd.Series,
+    label_encoder: LabelEncoder,
+    oof_probabilities: dict[str, np.ndarray],
+    oof_ensemble_info: dict,
+    mlflow_module=None,
+) -> dict:
+    """Evaluate ensemble-weight selection on held-out OOF rows.
+
+    The final OOF score can be optimistic when weights are chosen and evaluated
+    on the same rows. This diagnostic repeatedly chooses weights on one OOF
+    subset and evaluates them on a separate subset.
+    """
+
+    model_names = list(oof_probabilities)
+    y_enc = label_encoder.transform(y)
+    stack = np.stack([oof_probabilities[name] for name in model_names], axis=0)
+    all_idx = np.arange(len(y_enc))
+
+    rows = []
+    selected_weights = []
+    for seed in BLENDING_HOLDOUT_SEEDS:
+        blend_idx, valid_idx = train_test_split(
+            all_idx,
+            test_size=0.35,
+            random_state=seed,
+            stratify=y_enc,
+        )
+        candidates, labels = make_weight_candidates(model_names, seed, n_random=1500)
+        best = None
+        for weights, label in zip(candidates, labels):
+            blend_score = score_weight_vector(weights, stack, y_enc, blend_idx)
+            if best is None or blend_score["f1_macro"] > best["blend_f1_macro"]:
+                valid_score = score_weight_vector(weights, stack, y_enc, valid_idx)
+                best = {
+                    "seed": seed,
+                    "label": label,
+                    "blend_f1_macro": blend_score["f1_macro"],
+                    "blend_accuracy": blend_score["accuracy"],
+                    "blend_balanced_accuracy": blend_score["balanced_accuracy"],
+                    "valid_f1_macro": valid_score["f1_macro"],
+                    "valid_accuracy": valid_score["accuracy"],
+                    "valid_balanced_accuracy": valid_score["balanced_accuracy"],
+                    "weights": weights,
+                }
+        selected_weights.append(best["weights"])
+        rows.append({k: v for k, v in best.items() if k != "weights"})
+
+    holdout_df = pd.DataFrame(rows)
+    holdout_df.to_csv(ARTIFACT_DIR / "ensemble_holdout_blending.csv", index=False)
+
+    stable_weights = np.mean(np.vstack(selected_weights), axis=0)
+    stable_weights = stable_weights / stable_weights.sum()
+    full_score = score_weight_vector(stable_weights, stack, y_enc, all_idx)
+    oof_score = score_weight_vector(np.array(oof_ensemble_info["weights"]), stack, y_enc, all_idx)
+    reference_record = {
+        "model_names": model_names,
+        "stable_weights": {name: float(w) for name, w in zip(model_names, stable_weights)},
+        "stable_full_oof": full_score,
+        "oof_optimized_full_oof": oof_score,
+        "holdout_valid_f1_macro_mean": float(holdout_df["valid_f1_macro"].mean()),
+        "holdout_valid_f1_macro_std": float(holdout_df["valid_f1_macro"].std()),
+        "holdout_valid_f1_macro_min": float(holdout_df["valid_f1_macro"].min()),
+    }
+    with open(ARTIFACT_DIR / "ensemble_holdout_summary.json", "w", encoding="utf-8") as f:
+        json.dump(reference_record, f, indent=2)
+
+    if mlflow_module is not None:
+        end_active_mlflow_run(mlflow_module)
+        with mlflow_module.start_run(run_name="ensemble_holdout_blending_audit"):
+            mlflow_module.log_param("purpose", "holdout_blending_overfit_check")
+            mlflow_module.log_param("seeds", ",".join(map(str, BLENDING_HOLDOUT_SEEDS)))
+            mlflow_module.log_metric("holdout_valid_f1_macro_mean", reference_record["holdout_valid_f1_macro_mean"])
+            mlflow_module.log_metric("holdout_valid_f1_macro_std", reference_record["holdout_valid_f1_macro_std"])
+            mlflow_module.log_metric("stable_full_oof_f1_macro", full_score["f1_macro"])
+            mlflow_module.log_metric("oof_optimized_full_oof_f1_macro", oof_score["f1_macro"])
+            mlflow_module.log_artifact(str(ARTIFACT_DIR / "ensemble_holdout_blending.csv"), artifact_path="classification_artifacts")
+            mlflow_module.log_artifact(str(ARTIFACT_DIR / "ensemble_holdout_summary.json"), artifact_path="classification_artifacts")
+
+    print("\nHoldout blending audit:")
+    print(holdout_df.to_string(index=False))
+    print("Stable weights full OOF macro F1:", round(full_score["f1_macro"], 6))
+    print("OOF-optimized weights full OOF macro F1:", round(oof_score["f1_macro"], 6))
+    return reference_record
+
+
+def maybe_use_stable_ensemble(
+    y: pd.Series,
+    label_encoder: LabelEncoder,
+    oof_probabilities: dict[str, np.ndarray],
+    ensemble_info: dict,
+    holdout_info: dict,
+) -> dict:
+    """Prefer stable holdout-derived weights when their OOF score is close enough."""
+
+    model_names = ensemble_info["model_names"]
+    y_enc = label_encoder.transform(y)
+    stack = np.stack([oof_probabilities[name] for name in model_names], axis=0)
+    stable_weights = np.array([holdout_info["stable_weights"][name] for name in model_names], dtype=float)
+    stable_weights = stable_weights / stable_weights.sum()
+    stable_proba = np.tensordot(stable_weights, stack, axes=(0, 0))
+    stable_pred = np.argmax(stable_proba, axis=1)
+    stable_acc = accuracy_score(y_enc, stable_pred)
+    stable_f1 = f1_score(y_enc, stable_pred, average="macro")
+
+    if ensemble_info["f1_macro"] - stable_f1 <= STABLE_ENSEMBLE_F1_TOLERANCE:
+        updated = dict(ensemble_info)
+        updated["weights"] = stable_weights
+        updated["accuracy"] = float(stable_acc)
+        updated["f1_macro"] = float(stable_f1)
+        updated["pred_encoded"] = stable_pred
+        updated["weight_strategy"] = "stable_holdout_average"
+        updated["holdout_summary"] = holdout_info
+        print("\nUsing stable holdout-average ensemble weights.")
+        return updated
+
+    ensemble_info["holdout_summary"] = holdout_info
+    print("\nKeeping OOF-optimized ensemble weights because stable weights were not close enough.")
+    return ensemble_info
+
+
 def fit_final_and_predict(models: dict[str, Pipeline], X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, ensemble_info):
     test_probabilities = []
     final_models = {}
@@ -900,6 +1298,42 @@ def save_slice_diagnostics(train_features: pd.DataFrame, y_true: pd.Series, y_pr
     return slice_df
 
 
+def save_oof_probability_audit(
+    train: pd.DataFrame,
+    y: pd.Series,
+    label_encoder: LabelEncoder,
+    oof_probabilities: dict[str, np.ndarray],
+    ensemble_info: dict,
+) -> pd.DataFrame:
+    """Save row-level OOF probabilities for model behavior analysis."""
+
+    class_labels = list(label_encoder.classes_)
+    model_names = ensemble_info["model_names"]
+    stack = np.stack([oof_probabilities[name] for name in model_names], axis=0)
+    ensemble_proba = np.tensordot(ensemble_info["weights"], stack, axes=(0, 0))
+    ensemble_pred = label_encoder.inverse_transform(np.argmax(ensemble_proba, axis=1))
+
+    rows = pd.DataFrame({"ID": train["ID"], "target": y, "ensemble_pred": ensemble_pred})
+    rows["ensemble_correct"] = rows["target"] == rows["ensemble_pred"]
+    rows["ensemble_confidence"] = ensemble_proba.max(axis=1)
+    rows["ensemble_margin"] = np.sort(ensemble_proba, axis=1)[:, -1] - np.sort(ensemble_proba, axis=1)[:, -2]
+    for class_idx, class_name in enumerate(class_labels):
+        rows[f"ensemble_proba_{class_name}"] = ensemble_proba[:, class_idx]
+
+    for model_name in model_names:
+        proba = oof_probabilities[model_name]
+        pred = label_encoder.inverse_transform(np.argmax(proba, axis=1))
+        rows[f"{model_name}_pred"] = pred
+        rows[f"{model_name}_confidence"] = proba.max(axis=1)
+        for class_idx, class_name in enumerate(class_labels):
+            rows[f"{model_name}_proba_{class_name}"] = proba[:, class_idx]
+
+    rows.to_csv(ARTIFACT_DIR / "oof_probability_audit.csv", index=False)
+    hard_rows = rows.sort_values(["ensemble_correct", "ensemble_margin", "ensemble_confidence"]).head(80)
+    hard_rows.to_csv(ARTIFACT_DIR / "oof_hard_examples.csv", index=False)
+    return rows
+
+
 def save_outputs(
     train: pd.DataFrame,
     test: pd.DataFrame,
@@ -938,6 +1372,7 @@ def save_outputs(
     report.to_csv(ARTIFACT_DIR / "ensemble_oof_classification_report.csv")
     cm.to_csv(ARTIFACT_DIR / "ensemble_oof_confusion_matrix.csv")
     slice_df = save_slice_diagnostics(train[[c for c in train.columns if c not in ["ID", "target"]]], y, oof_pred_labels)
+    oof_audit_df = save_oof_probability_audit(train, y, label_encoder, oof_probabilities, ensemble_info)
 
     with open(ARTIFACT_DIR / "ensemble_info.json", "w", encoding="utf-8") as f:
         json.dump(
@@ -948,6 +1383,7 @@ def save_outputs(
                 "oof_f1_macro": float(ensemble_info["f1_macro"]),
                 "weight_strategy": ensemble_info.get("weight_strategy", "unknown"),
                 "candidate_summary": ensemble_info.get("candidate_summary", []),
+                "holdout_summary": ensemble_info.get("holdout_summary", {}),
                 "classes": label_encoder.classes_.tolist(),
                 "random_state": RANDOM_STATE,
                 "n_splits": N_SPLITS,
@@ -962,6 +1398,7 @@ def save_outputs(
     test_distribution.to_csv(ARTIFACT_DIR / "test_prediction_distribution.csv")
 
     if mlflow_module is not None:
+        end_active_mlflow_run(mlflow_module)
         with mlflow_module.start_run(run_name="final_ensemble"):
             mlflow_module.log_param("model_names", ",".join(ensemble_info["model_names"]))
             mlflow_module.log_param("weight_strategy", ensemble_info.get("weight_strategy", "unknown"))
@@ -988,6 +1425,8 @@ def save_outputs(
     print(test_distribution.to_string())
     print("\nOOF slice diagnostics:")
     print(slice_df.to_string(index=False))
+    print("\nHardest OOF rows by ensemble margin:")
+    print(oof_audit_df.sort_values(["ensemble_correct", "ensemble_margin", "ensemble_confidence"]).head(12).to_string(index=False))
     print(f"\nSaved {OUTPUT_FILE}")
     print(f"Saved artifacts in {ARTIFACT_DIR}")
     print(f"Saved experiment log: {EXPERIMENT_LOG_FILE}")
@@ -1023,10 +1462,13 @@ def main() -> None:
     print("\nTarget distribution:")
     print(y.value_counts(normalize=True).sort_index().round(4).to_string())
 
+    run_adversarial_validation(X, X_test, mlflow_module)
     models, results, oof_probabilities = evaluate_models(X, y, label_encoder, mlflow_module)
     run_baseline_audit(X, y, mlflow_module)
     run_robust_validation_audit(X, y, mlflow_module)
     ensemble_info = optimize_ensemble_weights(y, label_encoder, oof_probabilities)
+    holdout_info = run_holdout_blending_audit(y, label_encoder, oof_probabilities, ensemble_info, mlflow_module)
+    ensemble_info = maybe_use_stable_ensemble(y, label_encoder, oof_probabilities, ensemble_info, holdout_info)
     test_proba, final_models = fit_final_and_predict(models, X, y, X_test, ensemble_info)
     save_outputs(train, test, sample, y, label_encoder, results, oof_probabilities, ensemble_info, test_proba, final_models, mlflow_module)
 
