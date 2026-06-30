@@ -49,8 +49,8 @@ warnings.filterwarnings("ignore")
 
 RANDOM_STATE = 42
 N_SPLITS = 5
-USE_TEAM_LESSON06_WEIGHTS = True
-PREFER_TEAM_LESSON06_IF_WITHIN_F1 = 0.0011
+USE_REFERENCE_ENSEMBLE_CANDIDATE = True
+REFERENCE_ENSEMBLE_F1_TOLERANCE = 0.0011
 TRAIN_FILE = "train_data.csv"
 TEST_FILE = "test_data.csv"
 SAMPLE_FILE = "sample_submission.csv"
@@ -722,11 +722,11 @@ def optimize_ensemble_weights(
         candidates.append(w)
     candidate_labels = [f"single_{name}" for name in model_names]
 
-    if USE_TEAM_LESSON06_WEIGHTS:
-        # Team-internal Lesson 06 ensemble candidate:
+    if USE_REFERENCE_ENSEMBLE_CANDIDATE:
+        # Reference soft-voting candidate:
         # these weights come from OOF probability blending over diverse models,
         # not from test labels or row-level overrides.
-        team_names = [
+        reference_names = [
             "lightgbm_simple_fe",
             "lightgbm_original",
             "random_forest_original",
@@ -734,14 +734,14 @@ def optimize_ensemble_weights(
             "hgb_simple_fe",
             "xgboost_simple_fe",
         ]
-        team_weights = np.array([0.169278, 0.103133, 0.273020, 0.156727, 0.038941, 0.258902], dtype=float)
-        if all(name in model_names for name in team_names):
+        reference_weights = np.array([0.169278, 0.103133, 0.273020, 0.156727, 0.038941, 0.258902], dtype=float)
+        if all(name in model_names for name in reference_names):
             w = np.zeros(len(model_names), dtype=float)
-            for name, weight in zip(team_names, team_weights):
+            for name, weight in zip(reference_names, reference_weights):
                 w[model_names.index(name)] = weight
             w = w / w.sum()
             candidates.append(w)
-            candidate_labels.append("team_lesson06_weights")
+            candidate_labels.append("reference_soft_voting_weights")
 
     for _ in range(6000):
         candidates.append(rng.dirichlet(np.ones(len(model_names))))
@@ -769,13 +769,16 @@ def optimize_ensemble_weights(
             best_pred = pred_enc
             best_label = label
 
-    team_record = next((record for record in candidate_records if record["label"] == "team_lesson06_weights"), None)
-    if team_record is not None and (best_f1 - team_record["f1_macro"]) <= PREFER_TEAM_LESSON06_IF_WITHIN_F1:
-        best_acc = team_record["accuracy"]
-        best_f1 = team_record["f1_macro"]
-        best_weights = team_record["weights"]
-        best_pred = team_record["pred_encoded"]
-        best_label = team_record["label"]
+    reference_record = next(
+        (record for record in candidate_records if record["label"] == "reference_soft_voting_weights"),
+        None,
+    )
+    if reference_record is not None and (best_f1 - reference_record["f1_macro"]) <= REFERENCE_ENSEMBLE_F1_TOLERANCE:
+        best_acc = reference_record["accuracy"]
+        best_f1 = reference_record["f1_macro"]
+        best_weights = reference_record["weights"]
+        best_pred = reference_record["pred_encoded"]
+        best_label = reference_record["label"]
 
     return {
         "model_names": model_names,
