@@ -40,7 +40,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.tree import DecisionTreeClassifier
+from sklearn.tree import DecisionTreeClassifier, export_text
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
@@ -453,6 +453,11 @@ def make_baseline_models() -> dict[str, Pipeline | BaseEstimator]:
     """
 
     return {
+        "decision_tree_raw_depth5": DecisionTreeClassifier(
+            max_depth=5,
+            class_weight="balanced",
+            random_state=RANDOM_STATE,
+        ),
         "knn_scaled": Pipeline(
             [
                 ("scaler", StandardScaler()),
@@ -552,6 +557,17 @@ def run_baseline_audit(
     baseline_df.to_csv(ARTIFACT_DIR / "baseline_results.csv", index=False)
     print(baseline_df.to_string(index=False))
 
+    raw_tree = DecisionTreeClassifier(max_depth=5, class_weight="balanced", random_state=RANDOM_STATE)
+    raw_tree.fit(X, y)
+    tree_importance = (
+        pd.DataFrame({"feature": X.columns, "importance": raw_tree.feature_importances_})
+        .sort_values("importance", ascending=False)
+        .reset_index(drop=True)
+    )
+    tree_importance.to_csv(ARTIFACT_DIR / "raw_decision_tree_feature_importance.csv", index=False)
+    tree_rules = export_text(raw_tree, feature_names=list(X.columns), max_depth=5)
+    (ARTIFACT_DIR / "raw_decision_tree_rules.txt").write_text(tree_rules, encoding="utf-8")
+
     if mlflow_module is not None:
         for _, row in baseline_df.iterrows():
             with mlflow_module.start_run(run_name=f"baseline_{row['model_name']}"):
@@ -564,6 +580,8 @@ def run_baseline_audit(
                 mlflow_module.log_metric("balanced_accuracy_mean", float(row["balanced_accuracy_mean"]))
                 mlflow_module.log_metric("f1_macro_mean", float(row["f1_macro_mean"]))
                 mlflow_module.log_metric("f1_macro_std", float(row["f1_macro_std"]))
+        mlflow_module.log_artifact(str(ARTIFACT_DIR / "raw_decision_tree_feature_importance.csv"), artifact_path="classification_artifacts")
+        mlflow_module.log_artifact(str(ARTIFACT_DIR / "raw_decision_tree_rules.txt"), artifact_path="classification_artifacts")
 
     return baseline_df
 
@@ -815,6 +833,73 @@ def fit_final_and_predict(models: dict[str, Pipeline], X: pd.DataFrame, y: pd.Se
     return weighted_proba, final_models
 
 
+def build_slice_masks(X: pd.DataFrame) -> dict[str, pd.Series]:
+    """Create train-only diagnostic slices for OOF error analysis."""
+
+    masks: dict[str, pd.Series] = {}
+    index = X.index
+    if "f10" in X.columns:
+        masks["f10_high_q90"] = X["f10"] >= X["f10"].quantile(0.90)
+        masks["f10_low_q10"] = X["f10"] <= X["f10"].quantile(0.10)
+    if "f12" in X.columns:
+        masks["f12_equals_0"] = X["f12"] == 0
+        masks["f12_equals_1"] = X["f12"] == 1
+    if {"f10", "f12"}.issubset(X.columns):
+        masks["f10_high_q90_and_f12_equals_0"] = (X["f10"] >= X["f10"].quantile(0.90)) & (X["f12"] == 0)
+
+    binary_cols = []
+    for col in X.columns:
+        vals = set(pd.Series(X[col]).dropna().unique())
+        if vals.issubset({0, 1, 0.0, 1.0}):
+            binary_cols.append(col)
+    if binary_cols:
+        default_pattern = X[binary_cols].mode().iloc[0].astype(int)
+        default_distance = X[binary_cols].astype(int).ne(default_pattern, axis=1).sum(axis=1)
+        masks["default_binary_pattern"] = default_distance == 0
+        masks["binary_pattern_distance_ge_3"] = default_distance >= 3
+
+    continuous_cols = [col for col in X.columns if col not in binary_cols]
+    if continuous_cols:
+        outlier_count = pd.Series(0, index=index)
+        for col in continuous_cols:
+            low = X[col].quantile(0.01)
+            high = X[col].quantile(0.99)
+            outlier_count += ((X[col] <= low) | (X[col] >= high)).astype(int)
+        masks["continuous_outlier_count_ge_1"] = outlier_count >= 1
+
+    masks["all_rows"] = pd.Series(True, index=index)
+    return masks
+
+
+def save_slice_diagnostics(train_features: pd.DataFrame, y_true: pd.Series, y_pred: np.ndarray) -> pd.DataFrame:
+    """Save OOF metrics for important train-only diagnostic slices."""
+
+    rows = []
+    masks = build_slice_masks(train_features)
+    for slice_name, mask in masks.items():
+        mask = pd.Series(mask, index=train_features.index).fillna(False).astype(bool)
+        n_rows = int(mask.sum())
+        if n_rows == 0:
+            continue
+        y_slice = y_true[mask]
+        pred_slice = pd.Series(y_pred, index=train_features.index)[mask]
+        rows.append(
+            {
+                "slice": slice_name,
+                "n_rows": n_rows,
+                "class1_rows": int((y_slice == "class1").sum()),
+                "class2_rows": int((y_slice == "class2").sum()),
+                "class3_rows": int((y_slice == "class3").sum()),
+                "accuracy": float(accuracy_score(y_slice, pred_slice)),
+                "macro_f1": float(f1_score(y_slice, pred_slice, average="macro")),
+                "balanced_accuracy": float(balanced_accuracy_score(y_slice, pred_slice)),
+            }
+        )
+    slice_df = pd.DataFrame(rows).sort_values(["slice"]).reset_index(drop=True)
+    slice_df.to_csv(ARTIFACT_DIR / "slice_diagnostics.csv", index=False)
+    return slice_df
+
+
 def save_outputs(
     train: pd.DataFrame,
     test: pd.DataFrame,
@@ -852,6 +937,7 @@ def save_outputs(
     )
     report.to_csv(ARTIFACT_DIR / "ensemble_oof_classification_report.csv")
     cm.to_csv(ARTIFACT_DIR / "ensemble_oof_confusion_matrix.csv")
+    slice_df = save_slice_diagnostics(train[[c for c in train.columns if c not in ["ID", "target"]]], y, oof_pred_labels)
 
     with open(ARTIFACT_DIR / "ensemble_info.json", "w", encoding="utf-8") as f:
         json.dump(
@@ -900,6 +986,8 @@ def save_outputs(
     print(cm.to_string())
     print("\nSubmission target distribution:")
     print(test_distribution.to_string())
+    print("\nOOF slice diagnostics:")
+    print(slice_df.to_string(index=False))
     print(f"\nSaved {OUTPUT_FILE}")
     print(f"Saved artifacts in {ARTIFACT_DIR}")
     print(f"Saved experiment log: {EXPERIMENT_LOG_FILE}")
