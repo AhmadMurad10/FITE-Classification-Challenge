@@ -6,6 +6,7 @@ joblib
 mlflow
 lightgbm
 xgboost
+imbalanced-learn
 dvc
 ipykernel
 nbconvert

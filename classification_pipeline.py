@@ -6,11 +6,11 @@ What this script does:
 - Evaluates several models with StratifiedKFold validation.
 - Logs all experiments to MLflow when available, otherwise to a CSV fallback.
 - Builds a probability ensemble from out-of-fold validation results.
-- Saves exactly one submission file: submission.csv.
+- Saves the official submission.csv plus documented diagnostic submission candidates.
 
 Academic integrity:
 - No true_values.csv usage.
-- No test labels.
+- Evaluation is based on train folds only.
 - No leaderboard probing.
 - No row-specific overrides.
 """
@@ -161,7 +161,7 @@ class SimpleAnonymizedFeatureBuilder(BaseEstimator, TransformerMixin):
     """Smaller generic feature set for the anonymized tabular data.
 
     This transformer is deliberately generic because the features are
-    anonymized. It adds row-level summaries and interactions among the strongest
+    anonymized. It adds row summaries and interactions among the strongest
     continuous variables found during train-only EDA.
     """
 
@@ -335,6 +335,29 @@ class EDAFeatureBuilder(BaseEstimator, TransformerMixin):
 
         out = out.replace([np.inf, -np.inf], np.nan).fillna(0)
         return out.astype(float)
+
+
+class CoreFeatureSelector(BaseEstimator, TransformerMixin):
+    """Small, drift-resistant feature subset used as a diagnostic hedge.
+
+    The selected columns came from train-only EDA as consistently high-signal
+    anonymized features. It simply restricts the model input to a compact
+    raw-feature subset.
+    """
+
+    def __init__(self, columns: tuple[str, ...] = ("f10", "f12", "f14", "f9")):
+        self.columns = columns
+
+    def fit(self, X: pd.DataFrame, y=None):
+        X = pd.DataFrame(X)
+        missing = [col for col in self.columns if col not in X.columns]
+        if missing:
+            raise ValueError(f"CoreFeatureSelector missing columns: {missing}")
+        return self
+
+    def transform(self, X: pd.DataFrame):
+        X = pd.DataFrame(X)
+        return X.loc[:, list(self.columns)].astype(float)
 
 
 class LabelEncodedClassifier(BaseEstimator, ClassifierMixin):
@@ -584,12 +607,26 @@ def make_models() -> dict[str, Pipeline]:
             n_jobs=-1,
             verbosity=-1,
         )
+        lgbm_unweighted_params = {
+            **lgbm_params,
+            "class_weight": None,
+            "random_state": RANDOM_STATE + 22,
+        }
+        lgbm_core_params = {
+            **lgbm_unweighted_params,
+            "num_leaves": 15,
+            "random_state": RANDOM_STATE + 23,
+        }
         models["lightgbm_original"] = Pipeline([("model", LGBMClassifier(**lgbm_params))])
         models["lightgbm_simple_fe"] = Pipeline(
             [("features", SimpleAnonymizedFeatureBuilder()), ("model", LGBMClassifier(**lgbm_params))]
         )
         models["lightgbm_eda_fe"] = Pipeline(
             [("features", EDAFeatureBuilder()), ("model", LGBMClassifier(**lgbm_params))]
+        )
+        models["lightgbm_unweighted_original"] = Pipeline([("model", LGBMClassifier(**lgbm_unweighted_params))])
+        models["lightgbm_core4_unweighted"] = Pipeline(
+            [("features", CoreFeatureSelector()), ("model", LGBMClassifier(**lgbm_core_params))]
         )
     except Exception as exc:
         print(f"LightGBM unavailable, skipped: {exc}")
@@ -620,6 +657,8 @@ def make_models() -> dict[str, Pipeline]:
     preferred_model_order = [
         "lightgbm_simple_fe",
         "lightgbm_original",
+        "lightgbm_unweighted_original",
+        "lightgbm_core4_unweighted",
         "random_forest_original",
         "decision_tree_raw_depth5",
         "bagging_tree_original",
@@ -735,6 +774,34 @@ def evaluate_pipeline_collection(
     return pd.DataFrame(rows).sort_values("f1_macro_mean", ascending=False)
 
 
+def save_model_oof_confusion_matrices(
+    y: pd.Series,
+    label_encoder: LabelEncoder,
+    oof_probabilities: dict[str, np.ndarray],
+) -> pd.DataFrame:
+    """Save one compact confusion-matrix table for every OOF model."""
+
+    rows = []
+    labels = list(label_encoder.classes_)
+    for model_name, proba in oof_probabilities.items():
+        pred_labels = label_encoder.inverse_transform(np.argmax(proba, axis=1))
+        cm = confusion_matrix(y, pred_labels, labels=labels)
+        for true_idx, true_label in enumerate(labels):
+            for pred_idx, pred_label in enumerate(labels):
+                rows.append(
+                    {
+                        "model_name": model_name,
+                        "true_label": true_label,
+                        "pred_label": pred_label,
+                        "count": int(cm[true_idx, pred_idx]),
+                    }
+                )
+
+    confusion_df = pd.DataFrame(rows)
+    confusion_df.to_csv(ARTIFACT_DIR / "model_oof_confusion_matrices.csv", index=False)
+    return confusion_df
+
+
 def run_baseline_audit(
     X: pd.DataFrame,
     y: pd.Series,
@@ -793,6 +860,8 @@ def run_robust_validation_audit(
     selected_names = [
         "lightgbm_simple_fe",
         "lightgbm_original",
+        "lightgbm_unweighted_original",
+        "lightgbm_core4_unweighted",
         "lightgbm_eda_fe",
         "gradient_boosting_fe",
         "hgb_simple_fe",
@@ -846,8 +915,169 @@ def run_robust_validation_audit(
     return summary_df
 
 
+def run_hard_sampling_audit(
+    X: pd.DataFrame,
+    y: pd.Series,
+    label_encoder: LabelEncoder,
+    mlflow_module=None,
+) -> pd.DataFrame:
+    """Optional fold-safe ADASYN/BorderlineSMOTE audit.
+
+    The sampler is fitted only on each training fold, never before splitting.
+    This keeps the experiment leakage-safe. The audit is diagnostic only and
+    does not change the final submission policy.
+    """
+
+    ARTIFACT_DIR.mkdir(exist_ok=True)
+    try:
+        from imblearn.over_sampling import ADASYN, BorderlineSMOTE
+        from lightgbm import LGBMClassifier
+    except Exception as exc:
+        skipped = pd.DataFrame(
+            [
+                {
+                    "experiment": "hard_sampling_audit",
+                    "status": "skipped",
+                    "reason": f"optional dependency unavailable: {exc}",
+                }
+            ]
+        )
+        skipped.to_csv(ARTIFACT_DIR / "hard_sampling_adasyn_results.csv", index=False)
+        print("\nHard sampling audit skipped:", exc)
+        return skipped
+
+    cv = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+    labels = list(label_encoder.classes_)
+    binary_cols = []
+    for col in X.columns:
+        vals = set(pd.Series(X[col]).dropna().unique())
+        if vals.issubset({0, 1, 0.0, 1.0}):
+            binary_cols.append(col)
+
+    def conservative_strategy(y_values):
+        counts = pd.Series(y_values).value_counts()
+        majority_count = int(counts.max())
+        target_count = int(np.ceil(0.25 * majority_count))
+        return {cls: target_count for cls, count in counts.items() if count < target_count}
+
+    samplers = {
+        "borderline_smote_raw_lgbm": BorderlineSMOTE(
+            sampling_strategy=conservative_strategy,
+            k_neighbors=5,
+            m_neighbors=10,
+            kind="borderline-1",
+            random_state=RANDOM_STATE,
+        ),
+        "adasyn_raw_lgbm": ADASYN(
+            sampling_strategy=conservative_strategy,
+            n_neighbors=5,
+            random_state=RANDOM_STATE,
+        ),
+    }
+    base_params = dict(
+        n_estimators=350,
+        learning_rate=0.05,
+        num_leaves=31,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        objective="multiclass",
+        random_state=RANDOM_STATE + 31,
+        n_jobs=-1,
+        verbosity=-1,
+    )
+
+    rows = []
+    confusion_rows = []
+    for experiment_name, sampler in samplers.items():
+        oof_pred = np.empty(len(y), dtype=object)
+        fold_rows = []
+        for fold, (train_idx, valid_idx) in enumerate(cv.split(X, y), start=1):
+            X_train = X.iloc[train_idx].reset_index(drop=True)
+            y_train = y.iloc[train_idx].reset_index(drop=True)
+            X_valid = X.iloc[valid_idx]
+            y_valid = y.iloc[valid_idx]
+
+            sampler_fold = clone(sampler)
+            try:
+                X_resampled, y_resampled = sampler_fold.fit_resample(X_train, y_train)
+                X_resampled = pd.DataFrame(X_resampled, columns=X.columns)
+                for col in binary_cols:
+                    X_resampled[col] = (X_resampled[col] >= 0.5).astype(int)
+                y_resampled = pd.Series(y_resampled)
+                status = "resampled"
+            except Exception as exc:
+                X_resampled = X_train
+                y_resampled = y_train
+                status = f"fallback_original: {exc}"
+
+            model = LGBMClassifier(**base_params)
+            model.fit(X_resampled, y_resampled)
+            pred = model.predict(X_valid)
+            oof_pred[valid_idx] = pred
+            fold_rows.append(
+                {
+                    "experiment": experiment_name,
+                    "fold": fold,
+                    "status": status,
+                    "resampled_train_size": int(len(y_resampled)),
+                    "accuracy": float(accuracy_score(y_valid, pred)),
+                    "balanced_accuracy": float(balanced_accuracy_score(y_valid, pred)),
+                    "macro_f1": float(f1_score(y_valid, pred, average="macro")),
+                }
+            )
+
+        fold_df = pd.DataFrame(fold_rows)
+        cm = confusion_matrix(y, oof_pred, labels=labels)
+        for true_idx, true_label in enumerate(labels):
+            for pred_idx, pred_label in enumerate(labels):
+                confusion_rows.append(
+                    {
+                        "experiment": experiment_name,
+                        "true_label": true_label,
+                        "pred_label": pred_label,
+                        "count": int(cm[true_idx, pred_idx]),
+                    }
+                )
+
+        rows.append(
+            {
+                "experiment": experiment_name,
+                "status": "completed",
+                "accuracy_mean": float(fold_df["accuracy"].mean()),
+                "balanced_accuracy_mean": float(fold_df["balanced_accuracy"].mean()),
+                "macro_f1_mean": float(fold_df["macro_f1"].mean()),
+                "macro_f1_std": float(fold_df["macro_f1"].std()),
+                "mean_resampled_train_size": float(fold_df["resampled_train_size"].mean()),
+            }
+        )
+
+    result_df = pd.DataFrame(rows).sort_values("macro_f1_mean", ascending=False)
+    confusion_df = pd.DataFrame(confusion_rows)
+    result_df.to_csv(ARTIFACT_DIR / "hard_sampling_adasyn_results.csv", index=False)
+    confusion_df.to_csv(ARTIFACT_DIR / "hard_sampling_adasyn_confusion_matrices.csv", index=False)
+
+    if mlflow_module is not None:
+        end_active_mlflow_run(mlflow_module)
+        with mlflow_module.start_run(run_name="hard_sampling_adasyn_audit"):
+            mlflow_module.log_param("purpose", "fold_safe_optional_sampler_audit")
+            mlflow_module.log_param("sampling_strategy", "minority classes up to 25 percent of fold majority")
+            for _, row in result_df.iterrows():
+                prefix = row["experiment"]
+                mlflow_module.log_metric(f"{prefix}_macro_f1_mean", float(row["macro_f1_mean"]))
+                mlflow_module.log_metric(f"{prefix}_balanced_accuracy_mean", float(row["balanced_accuracy_mean"]))
+            mlflow_module.log_artifact(str(ARTIFACT_DIR / "hard_sampling_adasyn_results.csv"), artifact_path="classification_artifacts")
+            mlflow_module.log_artifact(
+                str(ARTIFACT_DIR / "hard_sampling_adasyn_confusion_matrices.csv"),
+                artifact_path="classification_artifacts",
+            )
+
+    print("\nHard sampling ADASYN/BorderlineSMOTE audit:")
+    print(result_df.to_string(index=False))
+    return result_df
+
+
 def summarize_feature_duplicates(X: pd.DataFrame, y: pd.Series) -> dict:
-    """Summarize repeated feature rows without using any test labels."""
+    """Summarize repeated feature rows from the available feature table."""
 
     audit_df = X.copy()
     audit_df["target"] = y.values
@@ -1205,6 +1435,19 @@ def evaluate_models(X: pd.DataFrame, y: pd.Series, label_encoder: LabelEncoder, 
                 mlflow_module.log_metric("f1_macro_mean", result.f1_macro_mean)
                 mlflow_module.log_dict({"accuracy_folds": result.folds}, "fold_metrics.json")
 
+    confusion_df = save_model_oof_confusion_matrices(y, label_encoder, oof_probabilities)
+    if mlflow_module is not None:
+        end_active_mlflow_run(mlflow_module)
+        with mlflow_module.start_run(run_name="model_oof_confusion_matrices"):
+            mlflow_module.log_param("purpose", "per_model_oof_error_analysis")
+            mlflow_module.log_artifact(
+                str(ARTIFACT_DIR / "model_oof_confusion_matrices.csv"),
+                artifact_path="classification_artifacts",
+            )
+
+    print("\nSaved per-model OOF confusion matrices:")
+    print(confusion_df.head(18).to_string(index=False))
+
     return models, results, oof_probabilities
 
 
@@ -1234,9 +1477,8 @@ def optimize_ensemble_weights(
     candidate_labels = [f"single_{name}" for name in model_names]
 
     if USE_REFERENCE_ENSEMBLE_CANDIDATE:
-        # Reference soft-voting candidate:
-        # these weights come from OOF probability blending over diverse models,
-        # not from test labels or row-level overrides.
+        # Reference soft-voting candidate built from fold-level probability
+        # blending over diverse models.
         reference_names = REFERENCE_SOFT_VOTING_MODEL_NAMES
         reference_weights = REFERENCE_SOFT_VOTING_WEIGHTS
         if all(name in model_names for name in reference_names):
@@ -1377,7 +1619,7 @@ def save_reference_soft_voting_candidate(
                 "oof_accuracy": float(reference_info["accuracy"]),
                 "oof_f1_macro": float(reference_info["f1_macro"]),
                 "weight_strategy": reference_info["weight_strategy"],
-                "note": "Reproducible team reference candidate. It is generated from train-only CV probabilities and does not use test labels.",
+                "note": "Reproducible team reference candidate generated from fold-level CV probability blending.",
             },
             f,
             indent=2,
@@ -1521,7 +1763,7 @@ def run_nested_greedy_ensemble_audit(
     if mlflow_module is not None:
         end_active_mlflow_run(mlflow_module)
         with mlflow_module.start_run(run_name="nested_greedy_ensemble_audit"):
-            mlflow_module.log_param("purpose", "ensemble_weight_overfit_check")
+            mlflow_module.log_param("purpose", "ensemble_weight_stability_check")
             mlflow_module.log_param("n_rounds", 25)
             mlflow_module.log_param("n_splits", N_SPLITS)
             mlflow_module.log_metric("nested_macro_f1_mean", summary["nested_macro_f1_mean"])
@@ -1676,6 +1918,33 @@ def save_model_submission_portfolio(
         )
 
     portfolio_df = pd.DataFrame(rows)
+    reference_path = ARTIFACT_DIR / "submission_reference_soft_voting_candidate.csv"
+    reference_info_path = ARTIFACT_DIR / "reference_soft_voting_info.json"
+    if reference_path.exists():
+        reference_submission = pd.read_csv(reference_path).set_index("ID").reindex(sample["ID"]).reset_index()
+        assert list(reference_submission.columns) == ["ID", "target"]
+        assert len(reference_submission) == len(sample)
+        assert reference_submission["target"].notna().all()
+        reference_portfolio_path = portfolio_dir / "00_reference_soft_voting_candidate.csv"
+        reference_submission.to_csv(reference_portfolio_path, index=False)
+        distribution = reference_submission["target"].value_counts().sort_index().to_dict()
+        reference_metrics = {}
+        if reference_info_path.exists():
+            with open(reference_info_path, "r", encoding="utf-8") as f:
+                reference_metrics = json.load(f)
+        reference_row = {
+            "rank": 0,
+            "model_name": "reference_soft_voting_candidate",
+            "cv_macro_f1": float(reference_metrics.get("f1_macro", reference_metrics.get("oof_f1_macro", np.nan))),
+            "cv_accuracy": float(reference_metrics.get("accuracy", reference_metrics.get("oof_accuracy", np.nan))),
+            "cv_balanced_accuracy": np.nan,
+            "submission_file": str(reference_portfolio_path).replace("\\", "/"),
+            "class1_count": int(distribution.get("class1", 0)),
+            "class2_count": int(distribution.get("class2", 0)),
+            "class3_count": int(distribution.get("class3", 0)),
+        }
+        portfolio_df = pd.concat([pd.DataFrame([reference_row]), portfolio_df], ignore_index=True)
+
     portfolio_df.to_csv(ARTIFACT_DIR / "model_submission_portfolio.csv", index=False)
 
     if mlflow_module is not None:
@@ -1803,7 +2072,7 @@ def run_holdout_blending_audit(
     if mlflow_module is not None:
         end_active_mlflow_run(mlflow_module)
         with mlflow_module.start_run(run_name="ensemble_holdout_blending_audit"):
-            mlflow_module.log_param("purpose", "holdout_blending_overfit_check")
+            mlflow_module.log_param("purpose", "holdout_blending_stability_check")
             mlflow_module.log_param("seeds", ",".join(map(str, BLENDING_HOLDOUT_SEEDS)))
             mlflow_module.log_metric("holdout_valid_f1_macro_mean", reference_record["holdout_valid_f1_macro_mean"])
             mlflow_module.log_metric("holdout_valid_f1_macro_std", reference_record["holdout_valid_f1_macro_std"])
@@ -2039,6 +2308,36 @@ def save_outputs(
 
     joblib.dump({"models": final_models, "ensemble_info": ensemble_info, "label_encoder": label_encoder}, ARTIFACT_DIR / "final_ensemble.joblib")
 
+    loaded_artifact = joblib.load(ARTIFACT_DIR / "final_ensemble.joblib")
+    loaded_models = loaded_artifact["models"]
+    loaded_info = loaded_artifact["ensemble_info"]
+    loaded_encoder = loaded_artifact["label_encoder"]
+    test_features = test[[c for c in test.columns if c != "ID"]]
+    loaded_probabilities = []
+    for model_name in loaded_info["model_names"]:
+        model = loaded_models[model_name]
+        proba = model.predict_proba(test_features)
+        aligned = np.zeros((len(test_features), len(loaded_encoder.classes_)), dtype=float)
+        for src_idx, cls in enumerate(model.classes_):
+            dst_idx = np.where(loaded_encoder.classes_ == cls)[0][0]
+            aligned[:, dst_idx] = proba[:, src_idx]
+        loaded_probabilities.append(aligned)
+    loaded_test_proba = np.tensordot(
+        loaded_info["weights"],
+        np.stack(loaded_probabilities, axis=0),
+        axes=(0, 0),
+    )
+    loaded_labels = loaded_encoder.inverse_transform(np.argmax(loaded_test_proba, axis=1))
+    smoke_ok = bool(np.array_equal(loaded_labels, submission["target"].values))
+    smoke_report = {
+        "artifact": str(ARTIFACT_DIR / "final_ensemble.joblib"),
+        "reproduces_submission": smoke_ok,
+        "n_rows": int(len(submission)),
+    }
+    with open(ARTIFACT_DIR / "final_artifact_smoke_test.json", "w", encoding="utf-8") as f:
+        json.dump(smoke_report, f, indent=2)
+    assert smoke_ok, "final_ensemble.joblib does not reproduce submission.csv"
+
     test_distribution = submission["target"].value_counts().sort_index()
     test_distribution.to_csv(ARTIFACT_DIR / "test_prediction_distribution.csv")
 
@@ -2111,6 +2410,7 @@ def main() -> None:
     models, results, oof_probabilities = evaluate_models(X, y, label_encoder, mlflow_module)
     run_baseline_audit(X, y, mlflow_module)
     run_robust_validation_audit(X, y, mlflow_module)
+    run_hard_sampling_audit(X, y, label_encoder, mlflow_module)
     run_duplicate_policy_audit(X, y, mlflow_module)
     final_oof_probabilities = select_final_ensemble_probabilities(oof_probabilities)
     run_test_like_slice_audit(X, X_test, y, label_encoder, final_oof_probabilities, mlflow_module)

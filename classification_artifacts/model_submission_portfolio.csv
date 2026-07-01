@@ -1,4 +1,5 @@
 rank,model_name,cv_macro_f1,cv_accuracy,cv_balanced_accuracy,submission_file,class1_count,class2_count,class3_count
+0,reference_soft_voting_candidate,0.9907880061770763,0.9975,,classification_artifacts/model_submissions/00_reference_soft_voting_candidate.csv,81,185,2934
 1,bagging_tree_original,0.9892195426462514,0.9971875,0.9989712320934858,classification_artifacts/model_submissions/01_bagging_tree_original.csv,82,189,2929
 2,lightgbm_simple_fe,0.989022517531602,0.9971875,0.995691162279156,classification_artifacts/model_submissions/02_lightgbm_simple_fe.csv,80,186,2934
 3,lightgbm_original,0.9888970150120596,0.996875,0.9939367763142436,classification_artifacts/model_submissions/03_lightgbm_original.csv,81,186,2933

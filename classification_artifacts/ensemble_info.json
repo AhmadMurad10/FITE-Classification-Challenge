@@ -22,7 +22,7 @@
   "oof_accuracy": 0.9978125,
   "oof_f1_macro": 0.9917019932497285,
   "weight_strategy": "stable_holdout_average",
-  "final_model_policy": "conservative_private_safe_subset",
+  "final_model_policy": "conservative_private_safe",
   "analysis_models_note": "Additional EDA/tree models are evaluated for diagnostics, but the final submission uses the conservative subset.",
   "candidate_summary": [
     {
