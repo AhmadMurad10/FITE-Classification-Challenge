@@ -9,6 +9,7 @@ client_secret*.json
 FITE_solution.ipynb
 FITE_Classification_Challenge_MLflow_Colab_Ensemble*.ipynb
 output/doc/
+~$*.docx
 
 # Local/generated experiment outputs. The notebook can regenerate them.
 classification_artifacts/final_ensemble.joblib

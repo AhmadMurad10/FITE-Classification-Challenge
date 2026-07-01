@@ -1,0 +1,13 @@
+rank,model_name,cv_macro_f1,cv_accuracy,cv_balanced_accuracy,submission_file,class1_count,class2_count,class3_count
+1,bagging_tree_original,0.9892195426462514,0.9971875,0.9989712320934858,classification_artifacts/model_submissions/01_bagging_tree_original.csv,82,189,2929
+2,lightgbm_simple_fe,0.989022517531602,0.9971875,0.995691162279156,classification_artifacts/model_submissions/02_lightgbm_simple_fe.csv,80,186,2934
+3,lightgbm_original,0.9888970150120596,0.996875,0.9939367763142436,classification_artifacts/model_submissions/03_lightgbm_original.csv,81,186,2933
+4,decision_tree_raw_depth5,0.9881476544892868,0.9975,0.9922965456004728,classification_artifacts/model_submissions/04_decision_tree_raw_depth5.csv,74,189,2937
+5,gradient_boosting_fe,0.9873545740421854,0.99625,0.9969881440130792,classification_artifacts/model_submissions/05_gradient_boosting_fe.csv,81,192,2927
+6,lightgbm_eda_fe,0.9873513902569848,0.9965625,0.9971024950708264,classification_artifacts/model_submissions/06_lightgbm_eda_fe.csv,80,187,2933
+7,random_forest_original,0.9865448055602196,0.996875,0.9902328768039343,classification_artifacts/model_submissions/07_random_forest_original.csv,82,189,2929
+8,hgb_simple_fe,0.9851934093796608,0.9965625,0.9870335835123418,classification_artifacts/model_submissions/08_hgb_simple_fe.csv,81,187,2932
+9,hgb_original,0.983545502224979,0.995625,0.9868498656523578,classification_artifacts/model_submissions/09_hgb_original.csv,81,197,2922
+10,hgb_eda_fe,0.9834370691157708,0.9959375,0.9868048813968472,classification_artifacts/model_submissions/10_hgb_eda_fe.csv,81,196,2923
+11,xgboost_simple_fe,0.9782636694358252,0.995625,0.9814611427859784,classification_artifacts/model_submissions/11_xgboost_simple_fe.csv,81,187,2932
+12,extra_trees_original,0.8921860002091725,0.9765625,0.8443808804057611,classification_artifacts/model_submissions/12_extra_trees_original.csv,78,139,2983

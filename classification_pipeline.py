@@ -1619,6 +1619,81 @@ def save_master_comparison_table(
     return comparison_df
 
 
+def save_model_submission_portfolio(
+    models: dict[str, Pipeline],
+    results: list[ExperimentResult],
+    X: pd.DataFrame,
+    y: pd.Series,
+    X_test: pd.DataFrame,
+    test: pd.DataFrame,
+    sample: pd.DataFrame,
+    mlflow_module=None,
+) -> pd.DataFrame:
+    """Train every candidate model on all training rows and save its test submission.
+
+    These files are diagnostic submission candidates. The official
+    `submission.csv` remains controlled by the final ensemble policy.
+    """
+
+    portfolio_dir = ARTIFACT_DIR / "model_submissions"
+    portfolio_dir.mkdir(parents=True, exist_ok=True)
+    result_map = {result.model_name: result for result in results}
+    ordered_names = [
+        result.model_name
+        for result in sorted(results, key=lambda item: item.f1_macro_mean, reverse=True)
+        if result.model_name in models
+    ]
+
+    rows = []
+    for rank, model_name in enumerate(ordered_names, start=1):
+        model = clone(models[model_name])
+        model.fit(X, y)
+        pred = model.predict(X_test)
+        submission = pd.DataFrame({"ID": test["ID"], "target": pred})
+        submission = submission.set_index("ID").reindex(sample["ID"]).reset_index()
+        assert list(submission.columns) == ["ID", "target"]
+        assert len(submission) == len(sample)
+        assert submission["target"].notna().all()
+
+        safe_name = model_name.replace("/", "_").replace("\\", "_")
+        file_name = f"{rank:02d}_{safe_name}.csv"
+        path = portfolio_dir / file_name
+        submission.to_csv(path, index=False)
+        distribution = submission["target"].value_counts().sort_index().to_dict()
+        result = result_map[model_name]
+        rows.append(
+            {
+                "rank": rank,
+                "model_name": model_name,
+                "cv_macro_f1": float(result.f1_macro_mean),
+                "cv_accuracy": float(result.accuracy_mean),
+                "cv_balanced_accuracy": float(result.balanced_accuracy_mean),
+                "submission_file": str(path).replace("\\", "/"),
+                "class1_count": int(distribution.get("class1", 0)),
+                "class2_count": int(distribution.get("class2", 0)),
+                "class3_count": int(distribution.get("class3", 0)),
+            }
+        )
+
+    portfolio_df = pd.DataFrame(rows)
+    portfolio_df.to_csv(ARTIFACT_DIR / "model_submission_portfolio.csv", index=False)
+
+    if mlflow_module is not None:
+        end_active_mlflow_run(mlflow_module)
+        with mlflow_module.start_run(run_name="model_submission_portfolio"):
+            mlflow_module.log_param("purpose", "per_model_submission_candidates")
+            mlflow_module.log_param("n_model_submissions", len(portfolio_df))
+            for _, row in portfolio_df.head(12).iterrows():
+                mlflow_module.log_metric(f"rank_{int(row['rank']):02d}_{row['model_name']}_cv_macro_f1", float(row["cv_macro_f1"]))
+            mlflow_module.log_artifact(str(ARTIFACT_DIR / "model_submission_portfolio.csv"), artifact_path="classification_artifacts")
+            for path in sorted(portfolio_dir.glob("*.csv")):
+                mlflow_module.log_artifact(str(path), artifact_path="classification_artifacts/model_submissions")
+
+    print("\nPer-model submission portfolio:")
+    print(portfolio_df.to_string(index=False))
+    return portfolio_df
+
+
 def make_weight_candidates(model_names: list[str], random_state: int, n_random: int = 2000):
     """Generate single-model, reference, and random convex ensemble weights."""
 
@@ -2064,6 +2139,7 @@ def main() -> None:
     master_comparison = save_master_comparison_table(results, ensemble_info, reference_info, nested_summary)
     print("\nMaster comparison table:")
     print(master_comparison.head(16).to_string(index=False))
+    save_model_submission_portfolio(models, results, X, y, X_test, test, sample, mlflow_module)
     test_proba, final_models = fit_final_and_predict(models, X, y, X_test, ensemble_info)
     save_outputs(train, test, sample, y, label_encoder, results, oof_probabilities, ensemble_info, test_proba, final_models, mlflow_module)
 
