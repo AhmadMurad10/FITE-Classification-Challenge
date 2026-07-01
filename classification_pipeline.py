@@ -60,6 +60,16 @@ ARTIFACT_DIR = Path("classification_artifacts")
 ROBUST_VALIDATION_SEEDS = [7, 42, 123]
 BLENDING_HOLDOUT_SEEDS = [7, 42, 123, 2026, 2027]
 STABLE_ENSEMBLE_F1_TOLERANCE = 0.0020
+FINAL_ENSEMBLE_MODEL_NAMES = [
+    "lightgbm_simple_fe",
+    "lightgbm_original",
+    "random_forest_original",
+    "extra_trees_original",
+    "hgb_original",
+    "hgb_simple_fe",
+    "xgboost_simple_fe",
+    "gradient_boosting_fe",
+]
 
 
 def set_all_seeds(seed: int = RANDOM_STATE) -> None:
@@ -1044,6 +1054,15 @@ def optimize_ensemble_weights(
     }
 
 
+def select_final_ensemble_probabilities(oof_probabilities: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Use conservative final models while keeping all models for analysis."""
+
+    selected = {name: oof_probabilities[name] for name in FINAL_ENSEMBLE_MODEL_NAMES if name in oof_probabilities}
+    if len(selected) < 3:
+        raise RuntimeError("Not enough conservative final models are available for the final ensemble.")
+    return selected
+
+
 def make_weight_candidates(model_names: list[str], random_state: int, n_random: int = 2000):
     """Generate single-model, reference, and random convex ensemble weights."""
 
@@ -1382,6 +1401,8 @@ def save_outputs(
                 "oof_accuracy": float(ensemble_info["accuracy"]),
                 "oof_f1_macro": float(ensemble_info["f1_macro"]),
                 "weight_strategy": ensemble_info.get("weight_strategy", "unknown"),
+                "final_model_policy": "conservative_private_safe_subset",
+                "analysis_models_note": "Additional EDA/tree models are evaluated for diagnostics, but the final submission uses the conservative subset.",
                 "candidate_summary": ensemble_info.get("candidate_summary", []),
                 "holdout_summary": ensemble_info.get("holdout_summary", {}),
                 "classes": label_encoder.classes_.tolist(),
@@ -1466,9 +1487,10 @@ def main() -> None:
     models, results, oof_probabilities = evaluate_models(X, y, label_encoder, mlflow_module)
     run_baseline_audit(X, y, mlflow_module)
     run_robust_validation_audit(X, y, mlflow_module)
-    ensemble_info = optimize_ensemble_weights(y, label_encoder, oof_probabilities)
-    holdout_info = run_holdout_blending_audit(y, label_encoder, oof_probabilities, ensemble_info, mlflow_module)
-    ensemble_info = maybe_use_stable_ensemble(y, label_encoder, oof_probabilities, ensemble_info, holdout_info)
+    final_oof_probabilities = select_final_ensemble_probabilities(oof_probabilities)
+    ensemble_info = optimize_ensemble_weights(y, label_encoder, final_oof_probabilities)
+    holdout_info = run_holdout_blending_audit(y, label_encoder, final_oof_probabilities, ensemble_info, mlflow_module)
+    ensemble_info = maybe_use_stable_ensemble(y, label_encoder, final_oof_probabilities, ensemble_info, holdout_info)
     test_proba, final_models = fit_final_and_predict(models, X, y, X_test, ensemble_info)
     save_outputs(train, test, sample, y, label_encoder, results, oof_probabilities, ensemble_info, test_proba, final_models, mlflow_module)
 
