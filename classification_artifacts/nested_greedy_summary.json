@@ -1,0 +1,11 @@
+{
+  "nested_macro_f1_mean": 0.9899455430039836,
+  "nested_macro_f1_std": 0.008894421745962876,
+  "nested_accuracy_mean": 0.9974999999999999,
+  "final_greedy_oof_macro_f1": 0.9899095941509399,
+  "final_greedy_oof_accuracy": 0.9971875,
+  "final_weights": {
+    "lightgbm_simple_fe": 0.5,
+    "gradient_boosting_fe": 0.5
+  }
+}

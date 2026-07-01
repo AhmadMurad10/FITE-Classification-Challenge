@@ -1,55 +1,48 @@
 # FITE Classification Challenge
 
-This repository contains the reproducible notebook and training pipeline for the
-FITE Classification Challenge.
+This repository contains the reproducible notebook, Python pipeline, MLOps report, MLflow tracking database, and DVC data-versioning setup for the FITE Classification Challenge.
 
 ## Project Summary
 
-The task is a multi-class classification problem on anonymized tabular data.
-The final notebook trains several models, compares them using cross-validation,
-logs experiments with MLflow, and generates the Kaggle submission file:
+The task is a multi-class classification problem on anonymized tabular data. The pipeline trains several models, compares them with validation, logs experiments with MLflow, and generates the Kaggle submission file:
 
 ```text
 submission.csv
 ```
 
-Both submitted code files are complete:
+Main submitted files:
 
-- `classification_pipeline.ipynb` is self-contained and includes the full workflow split into readable notebook cells.
-- `classification_pipeline.py` is a standalone Python version of the same pipeline for direct execution.
-
-The notebook also includes two validation-audit sections:
-
-- `baseline_results.csv`: simpler comparison models such as KNN, Logistic Regression, Decision Tree, Bagging, and AdaBoost.
-- `robust_validation_summary.csv`: repeated cross-validation checks across multiple random seeds to verify that the strongest models are stable and not just lucky on one split.
+- `classification_pipeline.ipynb`: self-contained notebook with analysis, training, evaluation, and submission generation.
+- `classification_pipeline.py`: standalone Python version of the same pipeline.
+- `MLOps_Report.docx`: final MLOps report.
 
 ## How To Run
 
-1. Install the required Python packages:
+Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-2. Restore the data with DVC:
+Restore the data with DVC:
 
 ```bash
 dvc pull
 ```
 
-3. Run the notebook or the Python pipeline:
+Run the notebook:
 
 ```bash
 jupyter notebook classification_pipeline.ipynb
 ```
 
-or:
+Or run the Python pipeline:
 
 ```bash
 python classification_pipeline.py
 ```
 
-4. Submit the generated file:
+The output submission file is:
 
 ```text
 submission.csv
@@ -57,7 +50,7 @@ submission.csv
 
 ## DVC Data Versioning
 
-The raw CSV files are tracked with DVC instead of Git:
+Raw CSV files are tracked with DVC instead of Git:
 
 ```text
 train_data.csv.dvc
@@ -65,42 +58,59 @@ test_data.csv.dvc
 sample_submission.csv.dvc
 ```
 
-The DVC remote is currently configured to a Google Drive for Desktop folder:
+The DVC remote is configured as a Google Drive API remote:
 
 ```text
-G:\My Drive\FITE_Classification_Challenge_DVC
+gdrive://12AfjjB_qMloHxg0oZsQ4fbWs3zYJCeAo
 ```
 
-If a teammate has Google Drive mounted at a different path, they should update
-the remote locally before running `dvc pull`:
+Team members should be added to the Google OAuth test users list and should have access to the shared Google Drive folder. After that, they can run:
 
 ```bash
-dvc remote modify storage url "PATH_TO_TEAMMATE_GOOGLE_DRIVE_FOLDER"
 dvc pull
 ```
 
-Example:
-
-```bash
-dvc remote modify storage url "G:\My Drive\FITE_Classification_Challenge_DVC"
-dvc pull
-```
+If Google asks for authorization, sign in with the Google account that has access to the shared Drive folder. Do not commit `.dvc/config.local` or any `client_secret*.json` file.
 
 ## MLflow Experiment Tracking
 
-Experiments are tracked in `mlflow.db`. To open the dashboard, run:
+Experiments are tracked in:
+
+```text
+mlflow.db
+```
+
+Open the MLflow UI:
 
 ```bash
 mlflow ui --backend-store-uri sqlite:///mlflow.db
 ```
 
-Open the local MLflow URL, go to the `FITE_Classification_Challenge`
-experiment, and take a screenshot of the runs comparison table for the final
-report.
+Then open:
+
+```text
+http://127.0.0.1:5000
+```
+
+Take a screenshot of the runs comparison table for the final report.
+
+## Validation Artifacts
+
+Important generated reports:
+
+- `classification_artifacts/cv_results.csv`
+- `classification_artifacts/robust_validation_summary.csv`
+- `classification_artifacts/duplicate_policy_summary.csv`
+- `classification_artifacts/test_like_slice_summary.csv`
+- `classification_artifacts/nested_greedy_summary.json`
+- `classification_artifacts/master_comparison.csv`
+- `classification_artifacts/ensemble_info.json`
 
 ## Arabic Team Notes
 
-المشروع عبارة عن تصنيف متعدد الكلاسات. الداتا مجهولة المعنى، لذلك اعتمدنا على
-تحليل إحصائي عام، معالجة عدم توازن الكلاسات، وتجربة عدة موديلات بدل الاعتماد
-على معنى الأعمدة. كل تجربة مهمة يتم تسجيلها في MLflow، وملفات الداتا نفسها
-مدارة عبر DVC حتى لا نرفع ملفات CSV الثقيلة مباشرة على GitHub.
+المشروع عبارة عن تصنيف متعدد الكلاسات على بيانات مجهولة المعنى. لذلك اعتمدنا على تحليل إحصائي، تحقق داخلي، وتجربة عدة نماذج بدل الاعتماد على تفسير أسماء الأعمدة.
+
+استخدمنا `Macro F1` لأن توزيع الكلاسات غير متوازن، وسجلنا التجارب باستخدام `MLflow`، وتتبعنا ملفات الداتا باستخدام `DVC` حتى لا نرفع ملفات CSV الخام على GitHub.
+
+ملف الرفع النهائي `submission.csv` يتم توليده من النماذج فقط، بدون تعديل يدوي وبدون استخدام أي labels من ملف الاختبار.
+

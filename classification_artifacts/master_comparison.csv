@@ -1,0 +1,17 @@
+experiment,type,macro_f1,accuracy,balanced_accuracy,stability_note,used_for_final_submission
+final_conservative_ensemble,final_policy,0.9917019932497285,0.9978125,,stable_holdout_average,True
+reference_soft_voting_candidate,submission_candidate,0.9907880061770763,0.9975,,fixed probability weights,False
+nested_greedy_ensemble_audit,ensemble_audit,0.9899455430039836,0.9974999999999999,,mean over nested validation folds,False
+nested_greedy_oof_optimistic,diagnostic_only,0.9899095941509399,0.9971875,,optimistic OOF score; not used as final evidence,False
+bagging_tree_original,model_cv,0.9892195426462514,0.9971875,0.9989712320934858,single CV run,False
+lightgbm_simple_fe,model_cv,0.989022517531602,0.9971875,0.995691162279156,single CV run,True
+lightgbm_original,model_cv,0.9888970150120596,0.996875,0.9939367763142436,single CV run,True
+decision_tree_raw_depth5,model_cv,0.9881476544892868,0.9975,0.9922965456004728,single CV run,False
+gradient_boosting_fe,model_cv,0.9873545740421854,0.99625,0.9969881440130792,single CV run,True
+lightgbm_eda_fe,model_cv,0.9873513902569848,0.9965625,0.9971024950708264,single CV run,False
+random_forest_original,model_cv,0.9865448055602196,0.996875,0.9902328768039343,single CV run,True
+hgb_simple_fe,model_cv,0.9851934093796608,0.9965625,0.9870335835123418,single CV run,True
+hgb_original,model_cv,0.983545502224979,0.995625,0.9868498656523578,single CV run,True
+hgb_eda_fe,model_cv,0.9834370691157708,0.9959375,0.9868048813968472,single CV run,False
+xgboost_simple_fe,model_cv,0.9782636694358252,0.995625,0.9814611427859784,single CV run,True
+extra_trees_original,model_cv,0.8921860002091725,0.9765625,0.8443808804057611,single CV run,True

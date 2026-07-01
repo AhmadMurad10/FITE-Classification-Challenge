@@ -1,0 +1,7 @@
+model_name,mean_weight,selected_folds
+random_forest_original,0.72,1
+lightgbm_simple_fe,0.44800000000000006,5
+gradient_boosting_fe,0.3466666666666667,3
+extra_trees_original,0.28,2
+lightgbm_original,0.2,2
+hgb_original,0.04,1

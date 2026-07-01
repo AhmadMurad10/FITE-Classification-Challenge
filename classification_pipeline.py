@@ -70,6 +70,16 @@ FINAL_ENSEMBLE_MODEL_NAMES = [
     "xgboost_simple_fe",
     "gradient_boosting_fe",
 ]
+REFERENCE_SOFT_VOTING_MODEL_NAMES = [
+    "lightgbm_simple_fe",
+    "lightgbm_original",
+    "random_forest_original",
+    "extra_trees_original",
+    "hgb_simple_fe",
+    "xgboost_simple_fe",
+]
+REFERENCE_SOFT_VOTING_WEIGHTS = np.array([0.169278, 0.103133, 0.273020, 0.156727, 0.038941, 0.258902], dtype=float)
+FINAL_SUBMISSION_POLICY = "conservative_private_safe"
 
 
 def set_all_seeds(seed: int = RANDOM_STATE) -> None:
@@ -836,6 +846,156 @@ def run_robust_validation_audit(
     return summary_df
 
 
+def summarize_feature_duplicates(X: pd.DataFrame, y: pd.Series) -> dict:
+    """Summarize repeated feature rows without using any test labels."""
+
+    audit_df = X.copy()
+    audit_df["target"] = y.values
+    feature_cols = list(X.columns)
+    group_sizes = audit_df.groupby(feature_cols, dropna=False).size().rename("group_size")
+    target_counts = audit_df.groupby(feature_cols, dropna=False)["target"].nunique().rename("n_targets")
+    duplicate_summary = pd.concat([group_sizes, target_counts], axis=1).reset_index()
+
+    duplicate_groups = duplicate_summary[duplicate_summary["group_size"] > 1]
+    conflicting_groups = duplicate_groups[duplicate_groups["n_targets"] > 1]
+    exact_feature_duplicate_rows = int(X.duplicated().sum())
+    exact_feature_target_duplicate_rows = int(audit_df.duplicated(subset=feature_cols + ["target"]).sum())
+
+    return {
+        "rows": int(len(X)),
+        "unique_feature_rows": int(len(duplicate_summary)),
+        "exact_feature_duplicate_rows": exact_feature_duplicate_rows,
+        "duplicate_feature_groups": int(len(duplicate_groups)),
+        "conflicting_duplicate_feature_groups": int(len(conflicting_groups)),
+        "exact_feature_target_duplicate_rows": exact_feature_target_duplicate_rows,
+    }
+
+
+def build_duplicate_policy_dataset(X: pd.DataFrame, y: pd.Series, policy: str) -> tuple[pd.DataFrame, pd.Series]:
+    """Return a train-only dataset variant for duplicate-policy ablation."""
+
+    if policy == "keep_all_rows":
+        return X.copy(), y.copy()
+
+    work = X.copy()
+    work["target"] = y.values
+    feature_cols = list(X.columns)
+
+    if policy == "drop_feature_duplicates_keep_first":
+        reduced = work.drop_duplicates(subset=feature_cols, keep="first").reset_index(drop=True)
+    elif policy == "drop_exact_feature_target_duplicates_keep_first":
+        reduced = work.drop_duplicates(subset=feature_cols + ["target"], keep="first").reset_index(drop=True)
+    elif policy == "feature_duplicates_majority_target":
+        reduced = (
+            work.groupby(feature_cols, dropna=False)["target"]
+            .agg(lambda values: values.value_counts().index[0])
+            .reset_index()
+        )
+    else:
+        raise ValueError(f"Unknown duplicate policy: {policy}")
+
+    return reduced[feature_cols].reset_index(drop=True), reduced["target"].reset_index(drop=True)
+
+
+def run_duplicate_policy_audit(
+    X: pd.DataFrame,
+    y: pd.Series,
+    mlflow_module=None,
+) -> pd.DataFrame:
+    """Compare duplicate handling strategies with the same CV protocol.
+
+    This is intentionally diagnostic. It does not change the final submission
+    unless the evidence clearly supports a safer policy.
+    """
+
+    ARTIFACT_DIR.mkdir(exist_ok=True)
+    duplicate_stats = summarize_feature_duplicates(X, y)
+    pd.DataFrame([duplicate_stats]).to_csv(ARTIFACT_DIR / "duplicate_summary.csv", index=False)
+
+    selected_models: dict[str, Pipeline | BaseEstimator] = {
+        "decision_tree_raw_depth5": DecisionTreeClassifier(
+            max_depth=5,
+            class_weight="balanced",
+            random_state=RANDOM_STATE,
+        ),
+        "decision_tree_balanced_depth8": DecisionTreeClassifier(
+            max_depth=8,
+            min_samples_leaf=3,
+            class_weight="balanced",
+            random_state=RANDOM_STATE + 1,
+        ),
+        "extra_trees_fast": ExtraTreesClassifier(
+            n_estimators=180,
+            min_samples_leaf=1,
+            max_features="sqrt",
+            class_weight="balanced",
+            random_state=RANDOM_STATE + 2,
+            n_jobs=-1,
+        ),
+        "hgb_fast": HistGradientBoostingClassifier(
+            max_iter=140,
+            learning_rate=0.05,
+            l2_regularization=0.02,
+            random_state=RANDOM_STATE + 3,
+        ),
+    }
+    policies = [
+        "keep_all_rows",
+        "drop_exact_feature_target_duplicates_keep_first",
+        "drop_feature_duplicates_keep_first",
+        "feature_duplicates_majority_target",
+    ]
+
+    rows = []
+    print("\nDuplicate summary:")
+    print(pd.DataFrame([duplicate_stats]).to_string(index=False))
+    print("\nDuplicate policy audit:")
+
+    for policy in policies:
+        X_policy, y_policy = build_duplicate_policy_dataset(X, y, policy)
+        policy_results = evaluate_pipeline_collection(selected_models, X_policy, y_policy, RANDOM_STATE)
+        policy_results.insert(0, "duplicate_policy", policy)
+        policy_results.insert(1, "n_rows_after_policy", len(X_policy))
+        rows.append(policy_results)
+        print(f"\nPolicy: {policy} | rows: {len(X_policy)}")
+        print(policy_results[["model_name", "f1_macro_mean", "balanced_accuracy_mean", "accuracy_mean"]].to_string(index=False))
+
+    audit_df = pd.concat(rows, ignore_index=True)
+    audit_df.to_csv(ARTIFACT_DIR / "duplicate_policy_audit.csv", index=False)
+
+    summary_df = (
+        audit_df.groupby("duplicate_policy")
+        .agg(
+            best_f1_macro=("f1_macro_mean", "max"),
+            mean_f1_macro=("f1_macro_mean", "mean"),
+            best_balanced_accuracy=("balanced_accuracy_mean", "max"),
+            rows_after_policy=("n_rows_after_policy", "first"),
+        )
+        .reset_index()
+        .sort_values("best_f1_macro", ascending=False)
+    )
+    summary_df.to_csv(ARTIFACT_DIR / "duplicate_policy_summary.csv", index=False)
+    print("\nDuplicate policy summary:")
+    print(summary_df.to_string(index=False))
+
+    if mlflow_module is not None:
+        end_active_mlflow_run(mlflow_module)
+        with mlflow_module.start_run(run_name="duplicate_policy_audit"):
+            mlflow_module.log_param("purpose", "duplicate_handling_ablation")
+            mlflow_module.log_param("policies", ",".join(policies))
+            for key, value in duplicate_stats.items():
+                mlflow_module.log_metric(key, float(value))
+            for _, row in summary_df.iterrows():
+                safe_policy = row["duplicate_policy"]
+                mlflow_module.log_metric(f"{safe_policy}_best_f1_macro", float(row["best_f1_macro"]))
+                mlflow_module.log_metric(f"{safe_policy}_mean_f1_macro", float(row["mean_f1_macro"]))
+            mlflow_module.log_artifact(str(ARTIFACT_DIR / "duplicate_summary.csv"), artifact_path="classification_artifacts")
+            mlflow_module.log_artifact(str(ARTIFACT_DIR / "duplicate_policy_audit.csv"), artifact_path="classification_artifacts")
+            mlflow_module.log_artifact(str(ARTIFACT_DIR / "duplicate_policy_summary.csv"), artifact_path="classification_artifacts")
+
+    return audit_df
+
+
 def run_adversarial_validation(
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
@@ -883,6 +1043,98 @@ def run_adversarial_validation(
     print("\nAdversarial validation AUC:", round(float(auc), 6))
     print(drift_df.head(12).to_string(index=False))
     return drift_df
+
+
+def compute_adversarial_train_scores(X_train: pd.DataFrame, X_test: pd.DataFrame) -> tuple[float, np.ndarray]:
+    """Return train-vs-test AUC and OOF test-likeness scores for train rows."""
+
+    X_adv = pd.concat([X_train, X_test], axis=0, ignore_index=True)
+    y_adv = pd.Series([0] * len(X_train) + [1] * len(X_test))
+    cv = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+    oof = np.zeros(len(X_adv), dtype=float)
+    for train_idx, valid_idx in cv.split(X_adv, y_adv):
+        model = RandomForestClassifier(
+            n_estimators=250,
+            max_features="sqrt",
+            min_samples_leaf=3,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+        )
+        model.fit(X_adv.iloc[train_idx], y_adv.iloc[train_idx])
+        oof[valid_idx] = model.predict_proba(X_adv.iloc[valid_idx])[:, 1]
+
+    return float(roc_auc_score(y_adv, oof)), oof[: len(X_train)]
+
+
+def run_test_like_slice_audit(
+    X: pd.DataFrame,
+    X_test: pd.DataFrame,
+    y: pd.Series,
+    label_encoder: LabelEncoder,
+    oof_probabilities: dict[str, np.ndarray],
+    mlflow_module=None,
+) -> pd.DataFrame:
+    """Evaluate each OOF model on train rows that look most similar to test rows."""
+
+    ARTIFACT_DIR.mkdir(exist_ok=True)
+    auc, train_scores = compute_adversarial_train_scores(X, X_test)
+    q_low = float(np.quantile(train_scores, 1 / 3))
+    q_high = float(np.quantile(train_scores, 2 / 3))
+    masks = {
+        "all_train": np.ones(len(y), dtype=bool),
+        "least_test_like_third": train_scores <= q_low,
+        "middle_test_like_third": (train_scores > q_low) & (train_scores < q_high),
+        "most_test_like_third": train_scores >= q_high,
+    }
+    y_enc = label_encoder.transform(y)
+    rows = []
+    for model_name, proba in oof_probabilities.items():
+        pred = np.argmax(proba, axis=1)
+        for slice_name, mask in masks.items():
+            rows.append(
+                {
+                    "model_name": model_name,
+                    "slice": slice_name,
+                    "n_rows": int(mask.sum()),
+                    "class1_rows": int((y[mask] == "class1").sum()),
+                    "class2_rows": int((y[mask] == "class2").sum()),
+                    "class3_rows": int((y[mask] == "class3").sum()),
+                    "accuracy": float(accuracy_score(y_enc[mask], pred[mask])),
+                    "macro_f1": float(f1_score(y_enc[mask], pred[mask], average="macro")),
+                    "balanced_accuracy": float(balanced_accuracy_score(y_enc[mask], pred[mask])),
+                    "adversarial_auc": auc,
+                }
+            )
+
+    slice_df = pd.DataFrame(rows).sort_values(["slice", "macro_f1"], ascending=[True, False])
+    slice_df.to_csv(ARTIFACT_DIR / "test_like_slice_audit.csv", index=False)
+    pd.DataFrame({"ID": np.arange(len(train_scores)), "test_likeness": train_scores}).to_csv(
+        ARTIFACT_DIR / "adversarial_train_scores.csv",
+        index=False,
+    )
+    summary_df = (
+        slice_df[slice_df["slice"] == "most_test_like_third"]
+        .sort_values("macro_f1", ascending=False)
+        .reset_index(drop=True)
+    )
+    summary_df.to_csv(ARTIFACT_DIR / "test_like_slice_summary.csv", index=False)
+
+    if mlflow_module is not None:
+        end_active_mlflow_run(mlflow_module)
+        with mlflow_module.start_run(run_name="test_like_slice_audit"):
+            mlflow_module.log_param("purpose", "private_leaderboard_robustness_check")
+            mlflow_module.log_metric("adversarial_auc", auc)
+            for _, row in summary_df.head(8).iterrows():
+                safe_name = row["model_name"]
+                mlflow_module.log_metric(f"{safe_name}_most_test_like_macro_f1", float(row["macro_f1"]))
+            mlflow_module.log_artifact(str(ARTIFACT_DIR / "test_like_slice_audit.csv"), artifact_path="classification_artifacts")
+            mlflow_module.log_artifact(str(ARTIFACT_DIR / "test_like_slice_summary.csv"), artifact_path="classification_artifacts")
+            mlflow_module.log_artifact(str(ARTIFACT_DIR / "adversarial_train_scores.csv"), artifact_path="classification_artifacts")
+
+    print("\nTest-like slice audit:")
+    print("Adversarial train-vs-test AUC:", round(auc, 6))
+    print(summary_df[["model_name", "n_rows", "macro_f1", "accuracy", "balanced_accuracy"]].head(12).to_string(index=False))
+    return slice_df
 
 
 def evaluate_models(X: pd.DataFrame, y: pd.Series, label_encoder: LabelEncoder, mlflow_module=None):
@@ -985,15 +1237,8 @@ def optimize_ensemble_weights(
         # Reference soft-voting candidate:
         # these weights come from OOF probability blending over diverse models,
         # not from test labels or row-level overrides.
-        reference_names = [
-            "lightgbm_simple_fe",
-            "lightgbm_original",
-            "random_forest_original",
-            "extra_trees_original",
-            "hgb_simple_fe",
-            "xgboost_simple_fe",
-        ]
-        reference_weights = np.array([0.169278, 0.103133, 0.273020, 0.156727, 0.038941, 0.258902], dtype=float)
+        reference_names = REFERENCE_SOFT_VOTING_MODEL_NAMES
+        reference_weights = REFERENCE_SOFT_VOTING_WEIGHTS
         if all(name in model_names for name in reference_names):
             w = np.zeros(len(model_names), dtype=float)
             for name, weight in zip(reference_names, reference_weights):
@@ -1063,6 +1308,317 @@ def select_final_ensemble_probabilities(oof_probabilities: dict[str, np.ndarray]
     return selected
 
 
+def build_reference_soft_voting_info(
+    y: pd.Series,
+    label_encoder: LabelEncoder,
+    oof_probabilities: dict[str, np.ndarray],
+) -> dict | None:
+    """Build the team reference probability-weighted ensemble as a reproducible candidate."""
+
+    missing = [name for name in REFERENCE_SOFT_VOTING_MODEL_NAMES if name not in oof_probabilities]
+    if missing:
+        print("\nReference soft-voting candidate skipped; missing models:", ", ".join(missing))
+        return None
+
+    weights = REFERENCE_SOFT_VOTING_WEIGHTS.astype(float)
+    weights = weights / weights.sum()
+    stack = np.stack([oof_probabilities[name] for name in REFERENCE_SOFT_VOTING_MODEL_NAMES], axis=0)
+    blended = np.tensordot(weights, stack, axes=(0, 0))
+    pred_encoded = np.argmax(blended, axis=1)
+    y_encoded = label_encoder.transform(y)
+    return {
+        "model_names": list(REFERENCE_SOFT_VOTING_MODEL_NAMES),
+        "weights": weights,
+        "accuracy": float(accuracy_score(y_encoded, pred_encoded)),
+        "f1_macro": float(f1_score(y_encoded, pred_encoded, average="macro")),
+        "pred_encoded": pred_encoded,
+        "weight_strategy": "reference_soft_voting_candidate",
+        "candidate_summary": [],
+    }
+
+
+def save_reference_soft_voting_candidate(
+    models: dict[str, Pipeline],
+    X: pd.DataFrame,
+    y: pd.Series,
+    X_test: pd.DataFrame,
+    test: pd.DataFrame,
+    sample: pd.DataFrame,
+    label_encoder: LabelEncoder,
+    oof_probabilities: dict[str, np.ndarray],
+    mlflow_module=None,
+) -> dict | None:
+    """Save the teammate-style soft-voting candidate without overriding submission.csv."""
+
+    ARTIFACT_DIR.mkdir(exist_ok=True)
+    reference_info = build_reference_soft_voting_info(y, label_encoder, oof_probabilities)
+    if reference_info is None:
+        return None
+
+    test_proba, _ = fit_final_and_predict(models, X, y, X_test, reference_info)
+    pred_labels = label_encoder.inverse_transform(np.argmax(test_proba, axis=1))
+    reference_submission = pd.DataFrame({"ID": test["ID"], "target": pred_labels})
+    reference_submission = reference_submission.set_index("ID").reindex(sample["ID"]).reset_index()
+    reference_path = ARTIFACT_DIR / "submission_reference_soft_voting_candidate.csv"
+    reference_submission.to_csv(reference_path, index=False)
+
+    reference_distribution = reference_submission["target"].value_counts().sort_index()
+    reference_distribution.to_csv(ARTIFACT_DIR / "reference_soft_voting_distribution.csv")
+
+    info_path = ARTIFACT_DIR / "reference_soft_voting_info.json"
+    with open(info_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "model_names": reference_info["model_names"],
+                "weights": {
+                    name: float(weight)
+                    for name, weight in zip(reference_info["model_names"], reference_info["weights"])
+                },
+                "oof_accuracy": float(reference_info["accuracy"]),
+                "oof_f1_macro": float(reference_info["f1_macro"]),
+                "weight_strategy": reference_info["weight_strategy"],
+                "note": "Reproducible team reference candidate. It is generated from train-only CV probabilities and does not use test labels.",
+            },
+            f,
+            indent=2,
+        )
+
+    if mlflow_module is not None:
+        end_active_mlflow_run(mlflow_module)
+        with mlflow_module.start_run(run_name="reference_soft_voting_candidate"):
+            mlflow_module.log_param("purpose", "team_reference_submission_candidate")
+            mlflow_module.log_param("model_names", ",".join(reference_info["model_names"]))
+            for name, weight in zip(reference_info["model_names"], reference_info["weights"]):
+                mlflow_module.log_param(f"weight_{name}", float(weight))
+            mlflow_module.log_metric("oof_accuracy", float(reference_info["accuracy"]))
+            mlflow_module.log_metric("oof_f1_macro", float(reference_info["f1_macro"]))
+            mlflow_module.log_artifact(str(reference_path), artifact_path="classification_artifacts")
+            mlflow_module.log_artifact(str(info_path), artifact_path="classification_artifacts")
+            mlflow_module.log_artifact(
+                str(ARTIFACT_DIR / "reference_soft_voting_distribution.csv"),
+                artifact_path="classification_artifacts",
+            )
+
+    print("\nReference soft-voting candidate:")
+    print("OOF accuracy:", round(float(reference_info["accuracy"]), 6))
+    print("OOF macro F1:", round(float(reference_info["f1_macro"]), 6))
+    print("Saved candidate submission:", reference_path)
+    print("Candidate target distribution:")
+    print(reference_distribution.to_string())
+    return reference_info
+
+
+def greedy_select_ensemble_weights(
+    oof_probabilities: dict[str, np.ndarray],
+    y_encoded: np.ndarray,
+    row_idx: np.ndarray,
+    n_rounds: int = 25,
+) -> dict[str, float]:
+    """Greedy ensemble selection with replacement on a selected row subset."""
+
+    model_names = list(oof_probabilities)
+    selected: list[str] = []
+    current = np.zeros((len(row_idx), len(np.unique(y_encoded))), dtype=float)
+    best_first = max(
+        model_names,
+        key=lambda name: f1_score(y_encoded[row_idx], np.argmax(oof_probabilities[name][row_idx], axis=1), average="macro"),
+    )
+    selected.append(best_first)
+    current += oof_probabilities[best_first][row_idx]
+
+    for _ in range(n_rounds - 1):
+        current_score = f1_score(y_encoded[row_idx], np.argmax(current / len(selected), axis=1), average="macro")
+        trial_scores = []
+        for name in model_names:
+            trial_proba = (current + oof_probabilities[name][row_idx]) / (len(selected) + 1)
+            trial_score = f1_score(y_encoded[row_idx], np.argmax(trial_proba, axis=1), average="macro")
+            trial_scores.append((trial_score, name))
+        best_score, best_name = max(trial_scores, key=lambda item: item[0])
+        if best_score < current_score - 1e-12:
+            break
+        selected.append(best_name)
+        current += oof_probabilities[best_name][row_idx]
+
+    counts = pd.Series(selected).value_counts(normalize=True)
+    return {name: float(counts.get(name, 0.0)) for name in model_names if counts.get(name, 0.0) > 0}
+
+
+def blend_with_weight_dict(oof_probabilities: dict[str, np.ndarray], weights: dict[str, float], row_idx=None) -> np.ndarray:
+    """Blend probability matrices using a sparse weight dictionary."""
+
+    if row_idx is None:
+        first = next(iter(oof_probabilities.values()))
+        blended = np.zeros_like(first, dtype=float)
+    else:
+        first = next(iter(oof_probabilities.values()))
+        blended = np.zeros((len(row_idx), first.shape[1]), dtype=float)
+
+    total = float(sum(weights.values()))
+    for name, weight in weights.items():
+        if row_idx is None:
+            blended += oof_probabilities[name] * (weight / total)
+        else:
+            blended += oof_probabilities[name][row_idx] * (weight / total)
+    return blended
+
+
+def run_nested_greedy_ensemble_audit(
+    y: pd.Series,
+    label_encoder: LabelEncoder,
+    oof_probabilities: dict[str, np.ndarray],
+    mlflow_module=None,
+) -> dict:
+    """Estimate ensemble-weight robustness with nested OOF row splits."""
+
+    ARTIFACT_DIR.mkdir(exist_ok=True)
+    y_encoded = label_encoder.transform(y)
+    cv = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+    rows = []
+    weight_rows = []
+    for fold, (blend_idx, valid_idx) in enumerate(cv.split(np.arange(len(y_encoded)), y_encoded), start=1):
+        weights = greedy_select_ensemble_weights(oof_probabilities, y_encoded, blend_idx, n_rounds=25)
+        valid_proba = blend_with_weight_dict(oof_probabilities, weights, valid_idx)
+        valid_pred = np.argmax(valid_proba, axis=1)
+        rows.append(
+            {
+                "fold": fold,
+                "valid_macro_f1": float(f1_score(y_encoded[valid_idx], valid_pred, average="macro")),
+                "valid_accuracy": float(accuracy_score(y_encoded[valid_idx], valid_pred)),
+                "valid_balanced_accuracy": float(balanced_accuracy_score(y_encoded[valid_idx], valid_pred)),
+                "n_selected_models": int(len(weights)),
+            }
+        )
+        for name, weight in weights.items():
+            weight_rows.append({"fold": fold, "model_name": name, "weight": float(weight)})
+
+    nested_df = pd.DataFrame(rows)
+    weight_df = pd.DataFrame(weight_rows)
+    weight_summary = (
+        weight_df.groupby("model_name")
+        .agg(mean_weight=("weight", "mean"), selected_folds=("fold", "nunique"))
+        .reset_index()
+        .sort_values("mean_weight", ascending=False)
+    )
+
+    final_weights = greedy_select_ensemble_weights(oof_probabilities, y_encoded, np.arange(len(y_encoded)), n_rounds=25)
+    final_oof = blend_with_weight_dict(oof_probabilities, final_weights)
+    final_pred = np.argmax(final_oof, axis=1)
+    summary = {
+        "nested_macro_f1_mean": float(nested_df["valid_macro_f1"].mean()),
+        "nested_macro_f1_std": float(nested_df["valid_macro_f1"].std()),
+        "nested_accuracy_mean": float(nested_df["valid_accuracy"].mean()),
+        "final_greedy_oof_macro_f1": float(f1_score(y_encoded, final_pred, average="macro")),
+        "final_greedy_oof_accuracy": float(accuracy_score(y_encoded, final_pred)),
+        "final_weights": final_weights,
+    }
+
+    nested_df.to_csv(ARTIFACT_DIR / "nested_greedy_ensemble_audit.csv", index=False)
+    weight_df.to_csv(ARTIFACT_DIR / "nested_greedy_fold_weights.csv", index=False)
+    weight_summary.to_csv(ARTIFACT_DIR / "nested_greedy_weight_summary.csv", index=False)
+    with open(ARTIFACT_DIR / "nested_greedy_summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    if mlflow_module is not None:
+        end_active_mlflow_run(mlflow_module)
+        with mlflow_module.start_run(run_name="nested_greedy_ensemble_audit"):
+            mlflow_module.log_param("purpose", "ensemble_weight_overfit_check")
+            mlflow_module.log_param("n_rounds", 25)
+            mlflow_module.log_param("n_splits", N_SPLITS)
+            mlflow_module.log_metric("nested_macro_f1_mean", summary["nested_macro_f1_mean"])
+            mlflow_module.log_metric("nested_macro_f1_std", summary["nested_macro_f1_std"])
+            mlflow_module.log_metric("final_greedy_oof_macro_f1", summary["final_greedy_oof_macro_f1"])
+            for name, weight in final_weights.items():
+                mlflow_module.log_param(f"final_greedy_weight_{name}", float(weight))
+            mlflow_module.log_artifact(str(ARTIFACT_DIR / "nested_greedy_ensemble_audit.csv"), artifact_path="classification_artifacts")
+            mlflow_module.log_artifact(str(ARTIFACT_DIR / "nested_greedy_fold_weights.csv"), artifact_path="classification_artifacts")
+            mlflow_module.log_artifact(str(ARTIFACT_DIR / "nested_greedy_weight_summary.csv"), artifact_path="classification_artifacts")
+            mlflow_module.log_artifact(str(ARTIFACT_DIR / "nested_greedy_summary.json"), artifact_path="classification_artifacts")
+
+    print("\nNested greedy ensemble audit:")
+    print(nested_df.to_string(index=False))
+    print("Nested macro F1 mean:", round(summary["nested_macro_f1_mean"], 6))
+    print("Final greedy OOF macro F1:", round(summary["final_greedy_oof_macro_f1"], 6))
+    print("Greedy weight summary:")
+    print(weight_summary.to_string(index=False))
+    return summary
+
+
+def save_master_comparison_table(
+    results: list[ExperimentResult],
+    ensemble_info: dict,
+    reference_info: dict | None,
+    nested_summary: dict | None,
+) -> pd.DataFrame:
+    """Save one comparison table that includes final and diagnostic experiments."""
+
+    rows = []
+    for result in results:
+        rows.append(
+            {
+                "experiment": result.model_name,
+                "type": "model_cv",
+                "macro_f1": float(result.f1_macro_mean),
+                "accuracy": float(result.accuracy_mean),
+                "balanced_accuracy": float(result.balanced_accuracy_mean),
+                "stability_note": "single CV run",
+                "used_for_final_submission": result.model_name in ensemble_info["model_names"],
+            }
+        )
+
+    rows.append(
+        {
+            "experiment": "final_conservative_ensemble",
+            "type": "final_policy",
+            "macro_f1": float(ensemble_info["f1_macro"]),
+            "accuracy": float(ensemble_info["accuracy"]),
+            "balanced_accuracy": np.nan,
+            "stability_note": ensemble_info.get("weight_strategy", "unknown"),
+            "used_for_final_submission": FINAL_SUBMISSION_POLICY == "conservative_private_safe",
+        }
+    )
+
+    if reference_info is not None:
+        rows.append(
+            {
+                "experiment": "reference_soft_voting_candidate",
+                "type": "submission_candidate",
+                "macro_f1": float(reference_info["f1_macro"]),
+                "accuracy": float(reference_info["accuracy"]),
+                "balanced_accuracy": np.nan,
+                "stability_note": "fixed probability weights",
+                "used_for_final_submission": FINAL_SUBMISSION_POLICY == "reference_soft_voting_candidate",
+            }
+        )
+
+    if nested_summary is not None:
+        rows.append(
+            {
+                "experiment": "nested_greedy_ensemble_audit",
+                "type": "ensemble_audit",
+                "macro_f1": float(nested_summary["nested_macro_f1_mean"]),
+                "accuracy": float(nested_summary["nested_accuracy_mean"]),
+                "balanced_accuracy": np.nan,
+                "stability_note": "mean over nested validation folds",
+                "used_for_final_submission": False,
+            }
+        )
+        rows.append(
+            {
+                "experiment": "nested_greedy_oof_optimistic",
+                "type": "diagnostic_only",
+                "macro_f1": float(nested_summary["final_greedy_oof_macro_f1"]),
+                "accuracy": float(nested_summary["final_greedy_oof_accuracy"]),
+                "balanced_accuracy": np.nan,
+                "stability_note": "optimistic OOF score; not used as final evidence",
+                "used_for_final_submission": False,
+            }
+        )
+
+    comparison_df = pd.DataFrame(rows).sort_values("macro_f1", ascending=False).reset_index(drop=True)
+    comparison_df.to_csv(ARTIFACT_DIR / "master_comparison.csv", index=False)
+    return comparison_df
+
+
 def make_weight_candidates(model_names: list[str], random_state: int, n_random: int = 2000):
     """Generate single-model, reference, and random convex ensemble weights."""
 
@@ -1075,15 +1631,8 @@ def make_weight_candidates(model_names: list[str], random_state: int, n_random: 
         candidates.append(w)
         labels.append(f"single_{model_names[i]}")
 
-    reference_names = [
-        "lightgbm_simple_fe",
-        "lightgbm_original",
-        "random_forest_original",
-        "extra_trees_original",
-        "hgb_simple_fe",
-        "xgboost_simple_fe",
-    ]
-    reference_weights = np.array([0.169278, 0.103133, 0.273020, 0.156727, 0.038941, 0.258902], dtype=float)
+    reference_names = REFERENCE_SOFT_VOTING_MODEL_NAMES
+    reference_weights = REFERENCE_SOFT_VOTING_WEIGHTS
     if all(name in model_names for name in reference_names):
         w = np.zeros(len(model_names), dtype=float)
         for name, weight in zip(reference_names, reference_weights):
@@ -1401,7 +1950,7 @@ def save_outputs(
                 "oof_accuracy": float(ensemble_info["accuracy"]),
                 "oof_f1_macro": float(ensemble_info["f1_macro"]),
                 "weight_strategy": ensemble_info.get("weight_strategy", "unknown"),
-                "final_model_policy": "conservative_private_safe_subset",
+                "final_model_policy": FINAL_SUBMISSION_POLICY,
                 "analysis_models_note": "Additional EDA/tree models are evaluated for diagnostics, but the final submission uses the conservative subset.",
                 "candidate_summary": ensemble_info.get("candidate_summary", []),
                 "holdout_summary": ensemble_info.get("holdout_summary", {}),
@@ -1487,10 +2036,34 @@ def main() -> None:
     models, results, oof_probabilities = evaluate_models(X, y, label_encoder, mlflow_module)
     run_baseline_audit(X, y, mlflow_module)
     run_robust_validation_audit(X, y, mlflow_module)
+    run_duplicate_policy_audit(X, y, mlflow_module)
     final_oof_probabilities = select_final_ensemble_probabilities(oof_probabilities)
+    run_test_like_slice_audit(X, X_test, y, label_encoder, final_oof_probabilities, mlflow_module)
+    reference_info = save_reference_soft_voting_candidate(
+        models,
+        X,
+        y,
+        X_test,
+        test,
+        sample,
+        label_encoder,
+        oof_probabilities,
+        mlflow_module,
+    )
+    nested_summary = run_nested_greedy_ensemble_audit(y, label_encoder, final_oof_probabilities, mlflow_module)
     ensemble_info = optimize_ensemble_weights(y, label_encoder, final_oof_probabilities)
     holdout_info = run_holdout_blending_audit(y, label_encoder, final_oof_probabilities, ensemble_info, mlflow_module)
     ensemble_info = maybe_use_stable_ensemble(y, label_encoder, final_oof_probabilities, ensemble_info, holdout_info)
+    if FINAL_SUBMISSION_POLICY == "reference_soft_voting_candidate":
+        if reference_info is None:
+            raise RuntimeError("Reference soft-voting final policy requested, but the candidate is unavailable.")
+        ensemble_info = reference_info
+        print("\nFINAL_SUBMISSION_POLICY selects the reference soft-voting candidate.")
+    else:
+        print(f"\nFINAL_SUBMISSION_POLICY selects: {FINAL_SUBMISSION_POLICY}")
+    master_comparison = save_master_comparison_table(results, ensemble_info, reference_info, nested_summary)
+    print("\nMaster comparison table:")
+    print(master_comparison.head(16).to_string(index=False))
     test_proba, final_models = fit_final_and_predict(models, X, y, X_test, ensemble_info)
     save_outputs(train, test, sample, y, label_encoder, results, oof_probabilities, ensemble_info, test_proba, final_models, mlflow_module)
 

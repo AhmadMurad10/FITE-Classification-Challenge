@@ -4,6 +4,11 @@
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+client_secret*.json
+*client_secret*.json
+FITE_solution.ipynb
+FITE_Classification_Challenge_MLflow_Colab_Ensemble*.ipynb
+output/doc/
 
 # Local/generated experiment outputs. The notebook can regenerate them.
 classification_artifacts/final_ensemble.joblib

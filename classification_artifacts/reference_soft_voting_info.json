@@ -1,0 +1,22 @@
+{
+  "model_names": [
+    "lightgbm_simple_fe",
+    "lightgbm_original",
+    "random_forest_original",
+    "extra_trees_original",
+    "hgb_simple_fe",
+    "xgboost_simple_fe"
+  ],
+  "weights": {
+    "lightgbm_simple_fe": 0.16927783072216926,
+    "lightgbm_original": 0.10313289686710313,
+    "random_forest_original": 0.273019726980273,
+    "extra_trees_original": 0.1567268432731567,
+    "hgb_simple_fe": 0.03894096105903894,
+    "xgboost_simple_fe": 0.25890174109825886
+  },
+  "oof_accuracy": 0.9975,
+  "oof_f1_macro": 0.9907880061770763,
+  "weight_strategy": "reference_soft_voting_candidate",
+  "note": "Reproducible team reference candidate. It is generated from train-only CV probabilities and does not use test labels."
+}

@@ -1,0 +1,15 @@
+fold,model_name,weight
+1,lightgbm_simple_fe,0.5
+1,gradient_boosting_fe,0.5
+2,lightgbm_simple_fe,0.04
+2,lightgbm_original,0.16
+2,random_forest_original,0.72
+2,extra_trees_original,0.04
+2,gradient_boosting_fe,0.04
+3,lightgbm_simple_fe,0.5
+3,gradient_boosting_fe,0.5
+4,lightgbm_simple_fe,0.2
+4,lightgbm_original,0.24
+4,extra_trees_original,0.52
+4,hgb_original,0.04
+5,lightgbm_simple_fe,1.0
