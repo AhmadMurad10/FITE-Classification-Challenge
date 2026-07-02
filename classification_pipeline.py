@@ -79,7 +79,7 @@ REFERENCE_SOFT_VOTING_MODEL_NAMES = [
     "xgboost_simple_fe",
 ]
 REFERENCE_SOFT_VOTING_WEIGHTS = np.array([0.169278, 0.103133, 0.273020, 0.156727, 0.038941, 0.258902], dtype=float)
-FINAL_SUBMISSION_POLICY = "conservative_private_safe"
+FINAL_SUBMISSION_POLICY = "lightgbm_unweighted_original"
 
 
 def set_all_seeds(seed: int = RANDOM_STATE) -> None:
@@ -1550,6 +1550,40 @@ def select_final_ensemble_probabilities(oof_probabilities: dict[str, np.ndarray]
     return selected
 
 
+def build_single_model_final_info(
+    model_name: str,
+    y: pd.Series,
+    label_encoder: LabelEncoder,
+    oof_probabilities: dict[str, np.ndarray],
+) -> dict:
+    """Create an ensemble_info-compatible record for a single selected model."""
+
+    if model_name not in oof_probabilities:
+        raise RuntimeError(f"FINAL_SUBMISSION_POLICY requested '{model_name}', but it is not available.")
+
+    proba = oof_probabilities[model_name]
+    pred_encoded = proba.argmax(axis=1)
+    y_enc = label_encoder.transform(y)
+    pred_labels = label_encoder.inverse_transform(pred_encoded)
+
+    return {
+        "model_names": [model_name],
+        "weights": np.array([1.0], dtype=float),
+        "accuracy": float(accuracy_score(y, pred_labels)),
+        "f1_macro": float(f1_score(y, pred_labels, average="macro")),
+        "balanced_accuracy": float(balanced_accuracy_score(y_enc, pred_encoded)),
+        "pred_encoded": pred_encoded,
+        "weight_strategy": "single_best_cv_model",
+        "candidate_summary": [
+            {
+                "label": f"single_{model_name}",
+                "accuracy": float(accuracy_score(y, pred_labels)),
+                "f1_macro": float(f1_score(y, pred_labels, average="macro")),
+            }
+        ],
+    }
+
+
 def build_reference_soft_voting_info(
     y: pd.Series,
     label_encoder: LabelEncoder,
@@ -1809,13 +1843,13 @@ def save_master_comparison_table(
 
     rows.append(
         {
-            "experiment": "final_conservative_ensemble",
+            "experiment": f"final_{FINAL_SUBMISSION_POLICY}",
             "type": "final_policy",
             "macro_f1": float(ensemble_info["f1_macro"]),
             "accuracy": float(ensemble_info["accuracy"]),
-            "balanced_accuracy": np.nan,
+            "balanced_accuracy": float(ensemble_info.get("balanced_accuracy", np.nan)),
             "stability_note": ensemble_info.get("weight_strategy", "unknown"),
-            "used_for_final_submission": FINAL_SUBMISSION_POLICY == "conservative_private_safe",
+            "used_for_final_submission": True,
         }
     )
 
@@ -1944,6 +1978,12 @@ def save_model_submission_portfolio(
             "class3_count": int(distribution.get("class3", 0)),
         }
         portfolio_df = pd.concat([pd.DataFrame([reference_row]), portfolio_df], ignore_index=True)
+
+    portfolio_df = (
+        portfolio_df.sort_values("cv_macro_f1", ascending=False, na_position="last")
+        .reset_index(drop=True)
+    )
+    portfolio_df["rank"] = np.arange(1, len(portfolio_df) + 1)
 
     portfolio_df.to_csv(ARTIFACT_DIR / "model_submission_portfolio.csv", index=False)
 
@@ -2434,6 +2474,9 @@ def main() -> None:
             raise RuntimeError("Reference soft-voting final policy requested, but the candidate is unavailable.")
         ensemble_info = reference_info
         print("\nFINAL_SUBMISSION_POLICY selects the reference soft-voting candidate.")
+    elif FINAL_SUBMISSION_POLICY in oof_probabilities:
+        ensemble_info = build_single_model_final_info(FINAL_SUBMISSION_POLICY, y, label_encoder, oof_probabilities)
+        print(f"\nFINAL_SUBMISSION_POLICY selects single model: {FINAL_SUBMISSION_POLICY}")
     else:
         print(f"\nFINAL_SUBMISSION_POLICY selects: {FINAL_SUBMISSION_POLICY}")
     master_comparison = save_master_comparison_table(results, ensemble_info, reference_info, nested_summary)
