@@ -1,0 +1,5 @@
+{
+  "artifact": "classification_artifacts\\final_ensemble.joblib",
+  "reproduces_submission": true,
+  "n_rows": 3200
+}

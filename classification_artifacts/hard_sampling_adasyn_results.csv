@@ -1,0 +1,3 @@
+experiment,status,accuracy_mean,balanced_accuracy_mean,macro_f1_mean,macro_f1_std,mean_resampled_train_size
+borderline_smote_raw_lgbm,completed,0.9962499999999999,0.9919538840404425,0.9838366099500911,0.012155536484283117,3500.4
+adasyn_raw_lgbm,completed,0.9959374999999999,0.9936389032031181,0.9836985474070266,0.008874835860412347,3496.8

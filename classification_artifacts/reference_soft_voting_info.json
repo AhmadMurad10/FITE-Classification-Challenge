@@ -18,5 +18,5 @@
   "oof_accuracy": 0.9975,
   "oof_f1_macro": 0.9907880061770763,
   "weight_strategy": "reference_soft_voting_candidate",
-  "note": "Reproducible team reference candidate. It is generated from train-only CV probabilities and does not use test labels."
+  "note": "Reproducible team reference candidate generated from fold-level CV probability blending."
 }
