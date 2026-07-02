@@ -1,111 +1,16 @@
 {
   "model_names": [
-    "lightgbm_simple_fe",
-    "lightgbm_original",
-    "random_forest_original",
-    "extra_trees_original",
-    "hgb_original",
-    "hgb_simple_fe",
-    "xgboost_simple_fe",
-    "gradient_boosting_fe"
+    "lightgbm_unweighted_original"
   ],
   "weights": {
-    "lightgbm_simple_fe": 0.1223013707646354,
-    "lightgbm_original": 0.06035076307607399,
-    "random_forest_original": 0.44848008313770454,
-    "extra_trees_original": 0.1535426735597371,
-    "hgb_original": 0.04232088526759755,
-    "hgb_simple_fe": 0.02817328774430951,
-    "xgboost_simple_fe": 0.03300178339584325,
-    "gradient_boosting_fe": 0.11182915305409871
+    "lightgbm_unweighted_original": 1.0
   },
-  "oof_accuracy": 0.9978125,
-  "oof_f1_macro": 0.9917019932497285,
-  "weight_strategy": "stable_holdout_average",
-  "final_model_policy": "conservative_private_safe",
-  "analysis_models_note": "Additional EDA/tree models are evaluated for diagnostics, but the final submission uses the conservative subset.",
-  "candidate_summary": [
-    {
-      "label": "single_lightgbm_simple_fe",
-      "accuracy": 0.9971875,
-      "f1_macro": 0.9889858166871424
-    },
-    {
-      "label": "single_lightgbm_original",
-      "accuracy": 0.996875,
-      "f1_macro": 0.9889375047662625
-    },
-    {
-      "label": "single_random_forest_original",
-      "accuracy": 0.996875,
-      "f1_macro": 0.9864247940579817
-    },
-    {
-      "label": "single_extra_trees_original",
-      "accuracy": 0.9765625,
-      "f1_macro": 0.8931217280708116
-    },
-    {
-      "label": "single_hgb_original",
-      "accuracy": 0.995625,
-      "f1_macro": 0.9834923303606131
-    },
-    {
-      "label": "single_hgb_simple_fe",
-      "accuracy": 0.9965625,
-      "f1_macro": 0.9853153414854571
-    },
-    {
-      "label": "single_xgboost_simple_fe",
-      "accuracy": 0.995625,
-      "f1_macro": 0.978312666028926
-    },
-    {
-      "label": "single_gradient_boosting_fe",
-      "accuracy": 0.99625,
-      "f1_macro": 0.9872198430381989
-    },
-    {
-      "label": "reference_soft_voting_weights",
-      "accuracy": 0.9975,
-      "f1_macro": 0.9907880061770763
-    }
-  ],
-  "holdout_summary": {
-    "model_names": [
-      "lightgbm_simple_fe",
-      "lightgbm_original",
-      "random_forest_original",
-      "extra_trees_original",
-      "hgb_original",
-      "hgb_simple_fe",
-      "xgboost_simple_fe",
-      "gradient_boosting_fe"
-    ],
-    "stable_weights": {
-      "lightgbm_simple_fe": 0.1223013707646354,
-      "lightgbm_original": 0.06035076307607399,
-      "random_forest_original": 0.44848008313770454,
-      "extra_trees_original": 0.1535426735597371,
-      "hgb_original": 0.04232088526759755,
-      "hgb_simple_fe": 0.02817328774430951,
-      "xgboost_simple_fe": 0.03300178339584325,
-      "gradient_boosting_fe": 0.11182915305409871
-    },
-    "stable_full_oof": {
-      "accuracy": 0.9978125,
-      "f1_macro": 0.9917019932497285,
-      "balanced_accuracy": 0.995938039390305
-    },
-    "oof_optimized_full_oof": {
-      "accuracy": 0.998125,
-      "f1_macro": 0.9926385075878899,
-      "balanced_accuracy": 0.9976832400883852
-    },
-    "holdout_valid_f1_macro_mean": 0.9916136825767043,
-    "holdout_valid_f1_macro_std": 0.005662621410598999,
-    "holdout_valid_f1_macro_min": 0.9842817316453969
-  },
+  "oof_accuracy": 0.9975,
+  "oof_f1_macro": 0.990790724130138,
+  "oof_balanced_accuracy": 0.9958055133369031,
+  "weight_strategy": "single_best_cv_model",
+  "final_model_policy": "lightgbm_unweighted_original",
+  "analysis_models_note": "The final submission uses the single model with the highest CV Macro F1.",
   "classes": [
     "class1",
     "class2",

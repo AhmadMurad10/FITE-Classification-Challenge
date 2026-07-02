@@ -1,5 +1,6 @@
 {
   "artifact": "classification_artifacts\\final_ensemble.joblib",
   "reproduces_submission": true,
-  "n_rows": 3200
+  "n_rows": 3200,
+  "final_model_policy": "lightgbm_unweighted_original"
 }
